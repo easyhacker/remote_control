@@ -6,7 +6,7 @@
   "excludePlatforms": [],
   "allowUnsafeCode": false,
   "overrideReferences": true,
-  "precompiledReferences": ["Newtonsoft.Json.dll"],
+  "precompiledReferences": ["Newtonsoft.Json.dll", "MQTTnet.dll"],
   "autoReferenced": true,
   "defineConstraints": [],
   "versionDefines": [],

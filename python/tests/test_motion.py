@@ -4,6 +4,11 @@ implementation:
   - LoopbackTransportTests   Python robot, in-process transport
   - WebSocketTransportTests  Python robot over WebSocket
   - CSharpRobotTests         the Unity package's C# core (built with plain .NET) over WebSocket
+  - MqttTransportTests       Python robot over MQTT
+  - CSharpMqttRobotTests     the C# core over MQTT
+
+MQTT tests use tools/mini_mqtt_broker.py, or a real broker if RC_MQTT_URL is set
+(e.g. RC_MQTT_URL=mqtt://localhost:1883 for Mosquitto).
 
 Run from the python/ folder:   python -m unittest discover -s tests -v
 The C# tests need the .NET SDK; they build unity/Packages/com.robotmarket.remote-control/Tests~/DotnetRobot.
@@ -15,9 +20,11 @@ import subprocess
 import sys
 import time
 import unittest
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
+sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
 from remote_control import (FakeDriver, GoalRejected, Joint, MotionController, RobotRuntime,  # noqa: E402
                             Trajectory)
@@ -61,6 +68,13 @@ class TrajectoryTests(unittest.TestCase):
         s = SeqTracker()
         self.assertEqual([s.accept(n) for n in (1, 2, 2, 1, 3)], [True, True, False, False, True])
 
+    def test_seq_tracker_accepts_out_of_order(self):
+        s = SeqTracker()   # MQTT cmd and ctrl topics are not ordered relative to each other
+        self.assertEqual([s.accept(n) for n in (1, 3, 2, 3, 2)], [True, True, True, False, False])
+        for n in range(4, 3000):
+            s.accept(n)
+        self.assertFalse(s.accept(5))  # outside the window
+
 
 class _Conformance:
     """Mixed into a TestCase per transport / robot implementation.
@@ -101,6 +115,12 @@ class _Conformance:
 
     def pos(self, joint):
         return self.robot.state["positions"][joint]
+
+    async def wait_offline(self, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while self.robot.online and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertFalse(self.robot.online, "controller never noticed the robot went away")
 
     # ── tests ────────────────────────────────────────────────────────────────
 
@@ -219,8 +239,7 @@ class _Conformance:
         goal = await self.robot.execute(["shoulder"], [([2.0], 1.0)])
         await asyncio.sleep(0.2)
         await self.drop_link()
-        await asyncio.sleep(0.05)
-        self.assertFalse(self.robot.online)
+        await self.wait_offline()
         robot = await self.controller.wait_for_robot(ROBOT_ID, timeout=5)
         self.assertIs(robot, self.robot)
         await self.wait_state("paused")
@@ -300,7 +319,7 @@ class _DotnetRobot:
     async def stop(self):
         self.proc.stdin.close()   # harness exits when stdin closes
         try:
-            self.proc.wait(timeout=5)
+            await asyncio.get_event_loop().run_in_executor(None, lambda: self.proc.wait(timeout=5))
         except subprocess.TimeoutExpired:
             self.proc.kill()
 
@@ -311,6 +330,60 @@ class CSharpRobotTests(_WebSocketController, _Conformance, unittest.IsolatedAsyn
     @classmethod
     def setUpClass(cls):
         _DotnetRobot.build()   # once, outside the event loop
+
+    async def start_robot(self, controller):
+        return _DotnetRobot(self.url)
+
+
+try:
+    import paho.mqtt  # noqa: F401
+    HAVE_MQTT = True
+except ImportError:
+    HAVE_MQTT = False
+
+
+class _MqttBroker:
+    """Each test gets its own topic prefix; the mini broker is started per test unless RC_MQTT_URL is set."""
+
+    async def make_controller_transport(self):
+        from remote_control.transports.mqtt import MqttControllerTransport
+        prefix = f"rctest{uuid.uuid4().hex[:8]}"
+        base = os.environ.get("RC_MQTT_URL")
+        if base:
+            self.broker = None
+            self.url = f"{base.rstrip('/')}/{prefix}"
+        else:
+            from mini_mqtt_broker import MiniBroker
+            self.broker = MiniBroker(port=0)
+            await self.broker.start()
+            self.url = f"mqtt://127.0.0.1:{self.broker.port}/{prefix}"
+        return MqttControllerTransport(self.url)
+
+    async def asyncTearDown(self):
+        await super().asyncTearDown()
+        if self.broker:
+            await self.broker.stop()
+
+    async def drop_link(self):
+        if self.broker:   # the robot's network fails: broker publishes its last will
+            self.assertTrue(await self.broker.kick(f"rc-robot-{ROBOT_ID}"))
+        else:
+            await super().drop_link()
+
+
+@unittest.skipUnless(HAVE_MQTT, "paho-mqtt not installed")
+class MqttTransportTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
+    async def start_robot(self, controller):
+        from remote_control.transports.mqtt import MqttRobotTransport
+        return await _PythonRobot(MqttRobotTransport(self.url)).start()
+
+
+@unittest.skipUnless(HAVE_MQTT and shutil.which("dotnet") and os.path.isdir(DOTNET_PROJECT),
+                     "needs paho-mqtt and the .NET SDK")
+class CSharpMqttRobotTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        _DotnetRobot.build()
 
     async def start_robot(self, controller):
         return _DotnetRobot(self.url)

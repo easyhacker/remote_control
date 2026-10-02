@@ -3,10 +3,10 @@ Pick a transport from an endpoint URL.
 
     controller_transport_from_url("ws://0.0.0.0:8765/motion")      # listen
     robot_transport_from_url("ws://192.168.1.10:8765/motion")      # dial
+    mqtt://[user:pass@]broker[:1883]/<prefix>                      # both sides (mqtts:// for TLS)
     loopback://<name>                                              # in-process (tests)
 
-Planned: mqtt://broker:1883/<prefix>, ros2://<namespace>. A new transport registers its scheme
-in the two tables below.
+Planned: ros2://<namespace>. A new transport registers its scheme in the two tables below.
 """
 from __future__ import annotations
 
@@ -27,6 +27,16 @@ def _ws_robot(url: str) -> RobotTransport:
     return WebSocketRobotTransport(url)
 
 
+def _mqtt_controller(url: str) -> ControllerTransport:
+    from .mqtt import MqttControllerTransport   # needs paho-mqtt
+    return MqttControllerTransport(url)
+
+
+def _mqtt_robot(url: str) -> RobotTransport:
+    from .mqtt import MqttRobotTransport
+    return MqttRobotTransport(url)
+
+
 def _loop_controller(url: str) -> ControllerTransport:
     return LoopbackControllerTransport(urlparse(url).netloc or "default")
 
@@ -35,8 +45,10 @@ def _loop_robot(url: str) -> RobotTransport:
     return LoopbackRobotTransport(urlparse(url).netloc or "default")
 
 
-CONTROLLER_SCHEMES = {"ws": _ws_controller, "loopback": _loop_controller}
-ROBOT_SCHEMES = {"ws": _ws_robot, "wss": _ws_robot, "loopback": _loop_robot}
+CONTROLLER_SCHEMES = {"ws": _ws_controller, "mqtt": _mqtt_controller, "mqtts": _mqtt_controller,
+                      "loopback": _loop_controller}
+ROBOT_SCHEMES = {"ws": _ws_robot, "wss": _ws_robot, "mqtt": _mqtt_robot, "mqtts": _mqtt_robot,
+                 "loopback": _loop_robot}
 
 
 def _lookup(table, url: str):

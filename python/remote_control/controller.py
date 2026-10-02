@@ -192,8 +192,9 @@ class RobotHandle(_Events):
         self.joints = [Joint.from_dict(j) for j in hello.get("joints", [])]
         self.supports = hello.get("supports", {})
         self.state = hello.get("state", {})
-        self.online = True
-        self._fire("online", {"robot_id": self.robot_id})
+        was_online, self.online = self.online, True
+        if not was_online:
+            self._fire("online", {"robot_id": self.robot_id})
         self._fire("state", self.state)
 
     def _detach(self) -> None:
@@ -301,11 +302,13 @@ class MotionController(_Events):
                 robot = self.robots[env.robot_id] = RobotHandle(self, env.robot_id)
             if robot.online and robot._link is not link:
                 robot._detach()  # same robot reconnected on a new link before the old one closed
+            rejoined = not robot.online
             info.robot = robot
             robot._attach(link, info.seq, env.payload)
             await robot._send(MsgType.WELCOME, {"heartbeat_interval": self.heartbeat_interval,
                                                 "heartbeat_timeout": self.heartbeat_timeout})
-            self._fire("robot_online", {"robot_id": robot.robot_id})
+            if rejoined:
+                self._fire("robot_online", {"robot_id": robot.robot_id})
             if self._robot_online is not None:
                 async with self._robot_online:
                     self._robot_online.notify_all()

@@ -69,11 +69,16 @@ class RobotTransport(abc.ABC):
         self.on_connected: Optional[EventHandler] = None
         self.on_disconnected: Optional[EventHandler] = None
         self.on_message: Optional[MessageHandler] = None
+        self.robot_id: Optional[str] = None
+
+    def bind(self, robot_id: str) -> None:
+        """Called by the runtime before start(); transports that address by robot (MQTT topics) need it."""
+        self.robot_id = robot_id
 
     @property
     @abc.abstractmethod
     def connected(self) -> bool:
-        ...
+        """True while messages can reach the controller (for MQTT: broker up AND controller present)."""
 
     @abc.abstractmethod
     async def start(self) -> None:

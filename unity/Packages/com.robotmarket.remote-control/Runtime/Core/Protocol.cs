@@ -3,6 +3,7 @@
 // This assembly has no UnityEngine references so it also builds and tests under plain .NET.
 
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -145,17 +146,29 @@ namespace RobotMarket.RemoteControl
         }
     }
 
-    /// <summary>Drops duplicate / stale incoming messages (MQTT QoS 1 may deliver twice).</summary>
+    /// <summary>
+    /// Drops duplicate incoming messages (MQTT QoS 1 may deliver twice). Transports with several topics
+    /// (MQTT cmd + ctrl) don't keep order across them, so out-of-order numbers are accepted; only ones
+    /// already seen, or older than Window, are rejected.
+    /// </summary>
     public sealed class SeqTracker
     {
-        long _last;
-        public void Reset() => _last = 0;
+        public const long Window = 1024;
+        long _max;
+        HashSet<long> _seen = new HashSet<long>();
+
+        public void Reset()
+        {
+            _max = 0;
+            _seen = new HashSet<long>();
+        }
 
         public bool Accept(long seq)
         {
             if (seq <= 0) return true;
-            if (seq <= _last) return false;
-            _last = seq;
+            if (seq <= _max - Window || !_seen.Add(seq)) return false;
+            if (seq > _max) _max = seq;
+            if (_seen.Count > 2 * Window) _seen.RemoveWhere(s => s <= _max - Window);
             return true;
         }
     }

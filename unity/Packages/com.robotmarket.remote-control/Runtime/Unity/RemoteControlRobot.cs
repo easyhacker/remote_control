@@ -14,7 +14,7 @@ namespace RobotMarket.RemoteControl.Unity
     public sealed class RemoteControlRobot : MonoBehaviour
     {
         [Header("Connection")]
-        [Tooltip("Controller endpoint, e.g. ws://localhost:8765/motion")]
+        [Tooltip("Controller endpoint: ws://host:8765/motion, or mqtt://[user:pass@]broker:1883/<prefix> (mqtts:// for TLS)")]
         public string controllerUrl = "ws://localhost:8765/motion";
         public string robotId = "unity-arm";
         public string displayName = "Unity arm";

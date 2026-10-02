@@ -27,7 +27,7 @@ Every message is one JSON object:
 | `type` | string | Message type (below). |
 | `robot_id` | string | Robot the message is about. |
 | `goal_id` | string, optional | Goal the message is about. |
-| `seq` | int | Per-sender counter, starting at 1 and increasing by 1. Used to drop duplicates (MQTT QoS 1 can deliver twice). It resets when the sender reconnects (new `hello` / `welcome`). |
+| `seq` | int | Per-sender counter, starting at 1 and increasing by 1. Receivers drop any number they have already seen (MQTT QoS 1 can deliver twice). Numbers may arrive out of order across channels (MQTT `cmd` and `ctrl` are separate topics), so receivers accept out-of-order numbers within a window of 1024. The counter resets when a `hello` / `welcome` starts a new session. |
 | `ts` | float | Sender's wall-clock time, in seconds. Informational only; never used for timing. |
 | `payload` | object | Type-specific body. |
 
@@ -48,7 +48,7 @@ Revolute joints use **radians**; prismatic joints use **meters**. Times are **se
 ## Messages: robot → controller
 
 ### `hello`
-Sent right after connecting.
+Sent right after connecting. It is sent again every `max(1 s, heartbeat_timeout)` until a `welcome` arrives, because over a broker a hello can be published while no controller is listening.
 ```json
 { "protocol": 1, "name": "Demo arm", "software": "remote-control-unity/0.1",
   "joints": [ { "name": "shoulder", "type": "revolute", "lower": -3.14, "upper": 3.14, "max_velocity": 2.0 } ],
@@ -180,8 +180,8 @@ An empty payload.
 
 Both sides send `heartbeat` every `heartbeat_interval` seconds.
 
-- If the robot hears nothing from the controller for `heartbeat_timeout` seconds while a goal is running,
-  or the connection drops, it pauses the goal with `pause_reason: "connection_lost"`. The goal stays paused across reconnects
+- If the robot hears nothing from the controller for `heartbeat_timeout` seconds, or the connection drops,
+  it pauses the running goal with `pause_reason: "connection_lost"` and re-sends `hello` until it is welcomed again. The goal stays paused across reconnects
   until the controller sends `resume` or `cancel`.
 - If the controller hears nothing from the robot for `heartbeat_timeout`, it treats the robot as offline.
 
@@ -192,9 +192,21 @@ After reconnecting, the robot sends a fresh `hello` that includes its current `s
 
 ## Transport mappings
 
-| | WebSocket (v1) | MQTT (planned) | ROS 2 (planned) |
+| | WebSocket | MQTT | ROS 2 (planned) |
 |---|---|---|---|
-| Address | Robot dials `ws://host:port/motion` | `mqtt://broker:1883/<prefix>` | `ros2://<namespace>` |
+| Address | Robot dials `ws://host:port/motion` | Both dial `mqtt://[user:pass@]broker:1883/<prefix>` (`mqtts://` for TLS) | `ros2://<namespace>` |
 | command | JSON text frame | `<prefix>/<robot_id>/cmd`, QoS 1 | `ExecuteMotion` action goal |
-| control | JSON text frame, handled ahead of goals | `<prefix>/<robot_id>/ctrl`, QoS 1 | action cancel + `pause` / `resume` / `stop` services |
-| status | JSON text frame | `<prefix>/<robot_id>/status`, QoS 1; `<prefix>/<robot_id>/online` is retained, with a last-will message | action feedback / result + `state` topic |
+| control | JSON text frame, handled ahead of goals | `<prefix>/<robot_id>/ctrl`, QoS 1 (heartbeats QoS 0) | action cancel + `pause` / `resume` / `stop` services |
+| status | JSON text frame | `<prefix>/<robot_id>/status`, QoS 1 (heartbeats QoS 0) | action feedback / result + `state` topic |
+| presence | the socket itself | `<prefix>/<robot_id>/online` and `<prefix>/_controller/online`: retained `"1"`, with `"0"` as last will | node graph |
+
+### MQTT details
+
+- Client ids are `rc-robot-<robot_id>` and `rc-controller-<random>`. Sessions are clean (MQTT 3.1.1). The default prefix is `rc`.
+- A robot treats itself as **connected** only while it is connected to the broker **and** the retained
+  controller presence is `"1"`. When the controller disappears, its last will sets presence to `"0"`, and robots
+  pause exactly as they would on a dropped WebSocket. When the controller comes back, they send `hello` again.
+- The controller opens a link for a robot on its first `status` message and binds it on `hello`. It closes the
+  link when the robot's presence becomes `"0"`.
+- `robot_id` must be a valid topic level: no `/`, `+` or `#`, and not `_controller`.
+- One controller per prefix. Multiple controllers would need goal ownership, which v1 does not define.

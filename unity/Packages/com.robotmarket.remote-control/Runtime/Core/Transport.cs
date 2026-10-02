@@ -27,7 +27,10 @@ namespace RobotMarket.RemoteControl
     public interface IRobotTransport : IDisposable
     {
         string Url { get; }
+        /// <summary>True while messages can reach the controller (MQTT: broker up AND controller present).</summary>
         bool Connected { get; }
+        /// <summary>Called by the session before Start(); transports that address by robot (MQTT topics) need it.</summary>
+        void Bind(string robotId);
         /// <summary>Begin connecting; reconnects automatically after drops until Stop().</summary>
         void Start();
         void Stop();
@@ -47,8 +50,11 @@ namespace RobotMarket.RemoteControl
                 case "ws":
                 case "wss":
                     return new WebSocketRobotTransport(url);
+                case "mqtt":
+                case "mqtts":
+                    return new MqttRobotTransport(url);
                 default:
-                    throw new NotSupportedException($"no transport for '{scheme}://' (known: ws, wss)");
+                    throw new NotSupportedException($"no transport for '{scheme}://' (known: ws, wss, mqtt, mqtts)");
             }
         }
     }
@@ -73,6 +79,8 @@ namespace RobotMarket.RemoteControl
         public WebSocketRobotTransport(string url) { Url = url; }
 
         public bool Connected => _connected;
+
+        public void Bind(string robotId) { }   // the controller learns the id from hello
 
         public void Start()
         {

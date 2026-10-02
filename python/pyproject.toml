@@ -11,6 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 websocket = ["websockets>=10"]
+mqtt = ["paho-mqtt>=2.0"]
+all = ["websockets>=10", "paho-mqtt>=2.0"]
 
 [tool.setuptools.packages.find]
 include = ["remote_control*"]

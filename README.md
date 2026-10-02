@@ -12,7 +12,7 @@ and pause, resume, cancel or stop the motion at any time. The behaviour is the s
  Controller (python)                                   Robot (Unity / Python / later: ROS bridge)
  MotionController ─ RobotHandle ─ GoalHandle            RemoteControlRobot / RobotRuntime
         │  Envelope (JSON)                                      │  Envelope (JSON)
- ControllerTransport  ◄──── ws:// (now) · mqtt:// · ros2:// ────►  RobotTransport
+ ControllerTransport  ◄──── ws:// · mqtt:// · (ros2:// next) ───►  RobotTransport
                                                                MotionExecutor ─► JointDriver
                                                                (pause = time-scale ramp)   (ArticulationBody, fake, …)
 ```
@@ -36,6 +36,20 @@ For your own robot, add **RemoteControlRobot** to the root `ArticulationBody`. E
 joint is listed under its GameObject name, with limits taken from the drive. Override joint names, limits or max speeds in the inspector.
 
 There is no Unity yet? Run `python examples/fake_robot.py` in place of step 3.
+
+### Over MQTT instead of WebSocket
+
+Both sides connect out to a broker, so robots and the controller can sit behind different routers.
+
+```bash
+.venv/Scripts/pip install paho-mqtt
+.venv/Scripts/python tools/mini_mqtt_broker.py --port 1883        # or use Mosquitto / EMQX / HiveMQ
+.venv/Scripts/python examples/controller_demo.py --url mqtt://127.0.0.1:1883/rc
+```
+
+In Unity, set **RemoteControlRobot → Controller Url** to `mqtt://127.0.0.1:1883/rc` (a player build takes
+`-controllerUrl mqtt://…`). The fake robot takes `--url mqtt://127.0.0.1:1883/rc`. Brokers with authentication use
+`mqtt://user:pass@host/rc`, and TLS uses `mqtts://`. `tools/mini_mqtt_broker.py` is for tests and demos only.
 
 ## Using the controller API
 
@@ -72,7 +86,13 @@ heartbeat loss, disconnect + reconnect) runs against:
 |---|---|
 | Python `RobotRuntime` | loopback (in-process) |
 | Python `RobotRuntime` | WebSocket |
+| Python `RobotRuntime` | MQTT |
 | C# core of the Unity package, built with plain .NET (`Tests~/DotnetRobot`) | WebSocket |
+| C# core of the Unity package, built with plain .NET | MQTT |
+
+MQTT tests start `tools/mini_mqtt_broker.py` for each test, and the disconnect test kills the robot's broker
+connection so that last-will and reconnect are exercised. To run them against a real broker, set
+`RC_MQTT_URL=mqtt://localhost:1883`. They need `pip install websockets paho-mqtt` and the .NET SDK, and skip whatever is missing.
 
 C# self-test of trajectory and parser, matched against the Python numbers:
 `dotnet run --project unity/Packages/com.robotmarket.remote-control/Tests~/DotnetRobot -- --selftest`
@@ -86,25 +106,29 @@ unity/Builds/RemoteControlDemo/RemoteControlDemo.exe -batchmode -nographics -con
 
 The player is built with `Unity -batchmode -projectPath unity -executeMethod RobotMarket.RemoteControl.Editor.DemoArmBuilder.BuildDemoPlayerBatch -quit`.
 
-## Adding a transport (MQTT, ROS 2, serial …)
+## Adding a transport (ROS 2, serial …)
 
 1. Python: subclass `ControllerTransport` and `RobotTransport` (`python/remote_control/transports/base.py`), then register the URL scheme in `transports/__init__.py`.
 2. C#: implement `IRobotTransport` and register the scheme in `TransportFactory`.
 3. Add a test class in `tests/test_motion.py` that runs `_Conformance` over the new transport.
 
-Channel mapping for MQTT and ROS 2 is specified in [PROTOCOL.md](PROTOCOL.md#transport-mappings).
+`transports/mqtt.py` and `Runtime/Core/MqttTransport.cs` are worked examples. Channel mappings are in
+[PROTOCOL.md](PROTOCOL.md#transport-mappings).
 
 ## Layout
 
 ```
 PROTOCOL.md
 python/
-  remote_control/   protocol.py · trajectory.py · executor.py · robot.py · controller.py · transports/
+  remote_control/   protocol.py · trajectory.py · executor.py · robot.py · controller.py
+                    transports/  loopback · websocket · mqtt
   examples/         controller_demo.py (interactive / --script) · fake_robot.py
+  tools/            mini_mqtt_broker.py (tests / demos)
   tests/            test_motion.py (conformance suite)
 unity/              Unity 6 project
   Packages/com.robotmarket.remote-control/
-    Runtime/Core/   no UnityEngine: Protocol · Trajectory · MotionExecutor · Transport (WebSocket) · RobotSession
+    Runtime/Core/   no UnityEngine: Protocol · Trajectory · MotionExecutor · Transport (WebSocket) · MqttTransport · RobotSession
+    Runtime/Plugins/MQTTnet/   MQTTnet 4.3.7 (netstandard2.1, MIT)
     Runtime/Unity/  ArticulationJointDriver · RemoteControlRobot (component + overlay)
     Editor/         DemoArmBuilder (menu + batch scene/player builds)
     Tests~/DotnetRobot/   .NET harness: C# core as a fake robot + self-test

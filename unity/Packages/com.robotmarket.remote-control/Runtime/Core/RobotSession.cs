@@ -32,7 +32,7 @@ namespace RobotMarket.RemoteControl
         readonly Sequencer _seq = new Sequencer();
         readonly SeqTracker _rx = new SeqTracker();
         readonly List<(string type, string goalId, JObject payload)> _outbox = new List<(string, string, JObject)>();
-        double _now, _lastRx, _lastHeartbeat;
+        double _now, _lastRx, _lastHeartbeat, _lastHello;
 
         public RobotSession(IRobotTransport transport, IJointDriver driver, string robotId,
                             string displayName = null, double decelTime = 0.4)
@@ -41,6 +41,7 @@ namespace RobotMarket.RemoteControl
             _driver = driver;
             RobotId = robotId;
             DisplayName = string.IsNullOrEmpty(displayName) ? robotId : displayName;
+            transport.Bind(robotId);
             Executor = new MotionExecutor(driver, (t, g, p) => _outbox.Add((t, g, p)), decelTime);
         }
 
@@ -66,7 +67,16 @@ namespace RobotMarket.RemoteControl
 
             if (Transport.Connected)
             {
-                if (_now - _lastRx > HeartbeatTimeout) Executor.PauseFor("connection_lost");
+                if (_now - _lastRx > HeartbeatTimeout)
+                {
+                    Executor.PauseFor("connection_lost");
+                    if (Welcomed)   // the controller lost us — announce again until welcomed
+                    {
+                        Welcomed = false;
+                        _lastHello = double.NegativeInfinity;
+                    }
+                }
+                if (!Welcomed && _now - _lastHello >= Math.Max(1.0, HeartbeatTimeout)) SendHello();
                 if (_now - _lastHeartbeat >= HeartbeatInterval)
                 {
                     _lastHeartbeat = _now;
@@ -104,10 +114,16 @@ namespace RobotMarket.RemoteControl
             _seq.Reset();
             _rx.Reset();
             _lastRx = _now;
-            Welcomed = false;
             _outbox.Clear();   // superseded by hello.state
-            _outbox.Add((MsgType.Hello, null, HelloPayload()));
+            SendHello();
             Flush();
+        }
+
+        void SendHello()
+        {
+            Welcomed = false;
+            _lastHello = _now;
+            _outbox.Add((MsgType.Hello, null, HelloPayload()));
         }
 
         void OnDisconnected(string reason)

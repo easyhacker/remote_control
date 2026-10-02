@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 PROTOCOL_VERSION = 1
 
@@ -149,20 +149,33 @@ class Sequencer:
 
 
 class SeqTracker:
-    """Drops duplicate / stale incoming messages (MQTT QoS 1 may deliver twice)."""
+    """
+    Drops duplicate incoming messages (MQTT QoS 1 may deliver twice).
+
+    Transports with several topics/channels (MQTT cmd + ctrl) do not keep order across them, so this
+    accepts out-of-order sequence numbers and only rejects ones already seen, or older than WINDOW.
+    """
+
+    WINDOW = 1024
 
     def __init__(self) -> None:
-        self._last = 0
+        self._max = 0
+        self._seen: Set[int] = set()
 
     def reset(self) -> None:
-        self._last = 0
+        self._max = 0
+        self._seen = set()
 
     def accept(self, seq: int) -> bool:
         if seq <= 0:  # unsequenced — always accept
             return True
-        if seq <= self._last:
+        if seq in self._seen or seq <= self._max - self.WINDOW:
             return False
-        self._last = seq
+        self._seen.add(seq)
+        if seq > self._max:
+            self._max = seq
+        if len(self._seen) > 2 * self.WINDOW:
+            self._seen = {s for s in self._seen if s > self._max - self.WINDOW}
         return True
 
 

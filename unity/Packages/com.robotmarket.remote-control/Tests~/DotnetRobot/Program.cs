@@ -1,4 +1,4 @@
-// dotnet run -- ws://127.0.0.1:8765/motion [robot_id]   → fake robot with the test joints
+// dotnet run -- ws://127.0.0.1:8765/motion [robot_id]   → fake robot with the test joints (also mqtt://host:port/prefix)
 // dotnet run -- --selftest                               → trajectory / parser checks
 using System;
 using System.Diagnostics;
@@ -22,7 +22,8 @@ static class Program
         var robotId = args.Length > 1 ? args[1] : "arm-test";
 
         var driver = new FakeDriver(TestJoints);
-        var transport = new WebSocketRobotTransport(url) { MinBackoff = 0.1 };
+        var transport = TransportFactory.FromUrl(url);
+        if (transport is WebSocketRobotTransport ws) ws.MinBackoff = 0.1;
         var session = new RobotSession(transport, driver, robotId, "dotnet fake robot", decelTime: 0.1);
         session.Start();
         Console.WriteLine($"fake robot '{robotId}' → {url}");

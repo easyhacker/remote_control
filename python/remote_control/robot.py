@@ -35,10 +35,13 @@ class RobotRuntime:
         self._outbox: List[Tuple[str, Optional[str], Dict[str, Any]]] = []
         self._last_rx = time.monotonic()
         self._last_hb = 0.0
+        self._last_hello = 0.0
+        self.welcomed = False
         self._task: Optional["asyncio.Future"] = None
         transport.on_connected = self._on_connected
         transport.on_disconnected = self._on_disconnected
         transport.on_message = self._on_message
+        transport.bind(robot_id)
 
     async def start(self) -> None:
         await self.transport.start()
@@ -86,10 +89,16 @@ class RobotRuntime:
         self._rx.reset()
         self._last_rx = time.monotonic()
         self._outbox.clear()  # anything queued while offline is superseded by hello.state
-        self._emit(MsgType.HELLO, None, self.hello_payload())
+        self._send_hello()
         await self._flush()
 
+    def _send_hello(self) -> None:
+        self.welcomed = False
+        self._last_hello = time.monotonic()
+        self._emit(MsgType.HELLO, None, self.hello_payload())
+
     async def _on_disconnected(self) -> None:
+        self.welcomed = False
         self.executor.pause_for("connection_lost")
 
     async def _on_message(self, env: Envelope) -> None:
@@ -101,6 +110,7 @@ class RobotRuntime:
             return
         self._last_rx = time.monotonic()
         if env.type == MsgType.WELCOME:
+            self.welcomed = True
             p = env.payload
             self.heartbeat_interval = float(p.get("heartbeat_interval", self.heartbeat_interval))
             self.heartbeat_timeout = float(p.get("heartbeat_timeout", self.heartbeat_timeout))
@@ -120,6 +130,11 @@ class RobotRuntime:
             if self.transport.connected:
                 if now - self._last_rx > self.heartbeat_timeout:
                     self.executor.pause_for("connection_lost")
+                    if self.welcomed:  # controller lost us — announce again until welcomed
+                        self.welcomed = False
+                        self._last_hello = 0.0
+                if not self.welcomed and now - self._last_hello >= max(1.0, self.heartbeat_timeout):
+                    self._send_hello()
                 if now - self._last_hb >= self.heartbeat_interval:
                     self._last_hb = now
                     self._emit(MsgType.HEARTBEAT, None, {})

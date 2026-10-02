@@ -1,0 +1,79 @@
+// dotnet run -- ws://127.0.0.1:8765/motion [robot_id]   → fake robot with the test joints
+// dotnet run -- --selftest                               → trajectory / parser checks
+using System;
+using System.Diagnostics;
+using System.Threading;
+using Newtonsoft.Json.Linq;
+using RobotMarket.RemoteControl;
+
+static class Program
+{
+    static readonly Joint[] TestJoints =
+    {
+        new Joint { Name = "shoulder", Type = "revolute", Lower = -3.0, Upper = 3.0, MaxVelocity = 4.0 },
+        new Joint { Name = "elbow", Type = "revolute", Lower = -2.0, Upper = 2.0, MaxVelocity = 4.0 },
+        new Joint { Name = "slide", Type = "prismatic", Lower = 0.0, Upper = 0.5, MaxVelocity = 1.0 },
+    };
+
+    static int Main(string[] args)
+    {
+        if (args.Length > 0 && args[0] == "--selftest") return SelfTest();
+        var url = args.Length > 0 ? args[0] : "ws://127.0.0.1:8765/motion";
+        var robotId = args.Length > 1 ? args[1] : "arm-test";
+
+        var driver = new FakeDriver(TestJoints);
+        var transport = new WebSocketRobotTransport(url) { MinBackoff = 0.1 };
+        var session = new RobotSession(transport, driver, robotId, "dotnet fake robot", decelTime: 0.1);
+        session.Start();
+        Console.WriteLine($"fake robot '{robotId}' → {url}");
+
+        // Exit when the parent closes our stdin (or on Ctrl+C)
+        var quit = new ManualResetEventSlim(false);
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; quit.Set(); };
+        new Thread(() => { while (Console.In.ReadLine() != null) { } quit.Set(); }) { IsBackground = true }.Start();
+
+        var sw = Stopwatch.StartNew();
+        double last = 0;
+        while (!quit.IsSet)
+        {
+            Thread.Sleep(5);
+            double now = sw.Elapsed.TotalSeconds;
+            session.Update(now - last);
+            last = now;
+        }
+        session.Shutdown();
+        return 0;
+    }
+
+    static int SelfTest()
+    {
+        int fails = 0;
+        void Check(string name, bool ok) { Console.WriteLine((ok ? "PASS " : "FAIL ") + name); if (!ok) fails++; }
+
+        var tr = new Trajectory(new[] { 0.0 }, new[] { 1.0, 2.0, 3.0 }, new[] { new[] { 1.0 }, new[] { 3.0 }, new[] { 2.0 } });
+        Check("cubic passes points", Math.Abs(tr.Sample(1)[0] - 1) < 1e-9 && Math.Abs(tr.Sample(2)[0] - 3) < 1e-9 && Math.Abs(tr.Sample(3)[0] - 2) < 1e-9);
+        Check("zero start velocity", Math.Abs((tr.Sample(1e-4)[0] - tr.Sample(0)[0]) / 1e-4) < 0.01);
+        // Same numbers as the Python implementation (python -c "from remote_control import Trajectory; ...")
+        Check("matches python samples", Math.Abs(tr.Sample(1.5)[0] - 2.1875) < 1e-9 && Math.Abs(tr.Sample(0.5)[0] - 0.3125) < 1e-9 && Math.Abs(tr.Sample(2.7)[0] - 2.216) < 1e-9);
+
+        var joints = new System.Collections.Generic.Dictionary<string, Joint>();
+        foreach (var j in TestJoints) joints[j.Name] = j;
+        string Reject(string json)
+        {
+            try { GoalParser.Parse(JObject.Parse(json), joints); return null; }
+            catch (GoalException e) { return e.Message; }
+        }
+        Check("rejects limit", Reject("{\"joint_names\":[\"shoulder\"],\"points\":[{\"positions\":[3.5],\"time_from_start\":1}]}")?.Contains("above upper limit") == true);
+        Check("rejects speed", Reject("{\"joint_names\":[\"slide\"],\"points\":[{\"positions\":[0.1],\"time_from_start\":1},{\"positions\":[0.5],\"time_from_start\":1.1}]}")?.Contains("max_velocity") == true);
+        Check("accepts valid", Reject("{\"joint_names\":[\"shoulder\",\"elbow\"],\"points\":[{\"positions\":[0.5,0.1],\"time_from_start\":1}],\"report\":\"all\"}") == null);
+
+        var env = Envelope.FromJson("{\"v\":1,\"type\":\"pause\",\"robot_id\":\"r\",\"goal_id\":\"g1\",\"seq\":7,\"ts\":1.5,\"payload\":{}}");
+        Check("envelope roundtrip", env.Type == "pause" && env.GoalId == "g1" && env.Seq == 7 && Envelope.FromJson(env.ToJson()).Seq == 7);
+        bool threw = false;
+        try { Envelope.FromJson("{\"v\":2,\"type\":\"x\",\"robot_id\":\"r\"}"); } catch (ProtocolException) { threw = true; }
+        Check("rejects other protocol version", threw);
+
+        Console.WriteLine(fails == 0 ? "ALL PASS" : $"{fails} FAILED");
+        return fails == 0 ? 0 : 1;
+    }
+}

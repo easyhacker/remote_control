@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# .NET harness
+**/Tests~/**/bin/
+**/Tests~/**/obj/
+
+# Unity
+unity/[Ll]ibrary/
+unity/[Tt]emp/
+unity/[Oo]bj/
+unity/[Ll]ogs/
+unity/[Bb]uild/
+unity/[Bb]uilds/
+unity/UserSettings/
+unity/*.csproj
+unity/*.sln
+unity/.vs/
+*.log

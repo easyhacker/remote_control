@@ -1,0 +1,14 @@
+{
+  "name": "RobotMarket.RemoteControl.Editor",
+  "rootNamespace": "RobotMarket.RemoteControl.Editor",
+  "references": ["RobotMarket.RemoteControl", "RobotMarket.RemoteControl.Core"],
+  "includePlatforms": ["Editor"],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

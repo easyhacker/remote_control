@@ -62,6 +62,12 @@ namespace RobotMarket.RemoteControl.Unity
         [Tooltip("Write commanded vs measured joint motion for every physics step to Logs/rc_tracking.csv")]
         public bool recordTracking = false;
         public bool showOverlay = true;
+        [Tooltip("Overlay starts expanded (joint list, recent messages) or as one summary line; click it or press the toggle key to switch")]
+        public bool overlayExpanded = true;
+        [Tooltip("Key that opens / closes the overlay while the Game view has focus (None = click only)")]
+        public KeyCode overlayToggleKey = KeyCode.F1;
+        [Tooltip("Overlay text size in pixels at 1080p (scaled up for larger Game view resolutions)")]
+        [Range(8, 40)] public int overlayFontSize = 18;
         public bool logMessages = false;
 
         public RobotSession Session { get; private set; }
@@ -227,38 +233,63 @@ namespace RobotMarket.RemoteControl.Unity
             if (logMessages) Debug.Log("[RemoteControl] " + line, this);
         }
 
+        static string CommName(IRobotTransport t) =>
+            t is MqttRobotTransport ? "MQTT" : t is WebSocketRobotTransport ? "WebSocket" : t?.GetType().Name ?? "none";
+
+        string StatusText() =>
+            Session.Connected
+                ? (Session.Welcomed ? "● connected" : "◐ connecting")
+                : "○ offline" + (Session.LastDisconnectReason != null ? "  (" + Session.LastDisconnectReason + ")" : "");
+
         void OnGUI()
         {
             if (!showOverlay || Session == null) return;
-            if (_style == null)
-                _style = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = 12, wordWrap = false };
+            if (_style == null || _style.fontSize != overlayFontSize)
+                _style = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = overlayFontSize, wordWrap = false };
+
+            var e = Event.current;
+            if (e.type == EventType.KeyDown && e.keyCode == overlayToggleKey && overlayToggleKey != KeyCode.None)
+            {
+                overlayExpanded = !overlayExpanded;
+                e.Use();
+            }
 
             var ex = Session.Executor;
-            var lines = new List<string>
+            var lines = new List<string>();
+            if (!overlayExpanded)
             {
-                $"{displayName} ({robotId})",
-                Session.Connected
-                    ? (Session.Welcomed ? "● connected  " : "◐ connecting  ") + _endpoint
-                    : "○ offline  " + _endpoint + (Session.LastDisconnectReason != null ? "  (" + Session.LastDisconnectReason + ")" : ""),
-                $"state: {ex.State}" + (ex.ActiveGoalId != null ? $"  goal {ex.ActiveGoalId}" : "")
-                    + (ex.PauseReason != null ? $"  [{ex.PauseReason}]" : "")
-                    + (ex.QueuedCount > 0 ? $"  +{ex.QueuedCount} queued" : ""),
-            };
-            var pos = Session.Executor.StatePayload()["positions"];
-            foreach (var j in ex.JointMap.Values)
-            {
-                double x = pos?[j.Name]?.ToObject<double?>() ?? 0;
-                lines.Add(string.Format(CultureInfo.InvariantCulture, "  {0,-14} {1,8:0.000} {2}",
-                    j.Name, x, j.Type == "prismatic" ? "m" : "rad"));
+                lines.Add($"[+] {displayName}   {CommName(Session.Transport)}   {StatusText()}   {ex.State}");
             }
-            if (_recent.Count > 0)
+            else
             {
-                lines.Add("recent:");
-                lines.AddRange(_recent.Reverse().Select(l => "  " + l));
+                lines.Add($"[-] {displayName} ({robotId})");
+                lines.Add($"comm: {CommName(Session.Transport)}   {_endpoint}");
+                lines.Add(StatusText());
+                lines.Add($"state: {ex.State}" + (ex.ActiveGoalId != null ? $"  goal {ex.ActiveGoalId}" : "")
+                    + (ex.PauseReason != null ? $"  [{ex.PauseReason}]" : "")
+                    + (ex.QueuedCount > 0 ? $"  +{ex.QueuedCount} queued" : ""));
+                var pos = ex.StatePayload()["positions"];
+                foreach (var j in ex.JointMap.Values)
+                {
+                    double x = pos?[j.Name]?.ToObject<double?>() ?? 0;
+                    lines.Add(string.Format(CultureInfo.InvariantCulture, "  {0,-14} {1,8:0.000} {2}",
+                        j.Name, x, j.Type == "prismatic" ? "m" : "rad"));
+                }
+                if (_recent.Count > 0)
+                {
+                    lines.Add("recent:");
+                    lines.AddRange(_recent.Reverse().Select(l => "  " + l));
+                }
             }
             var text = string.Join("\n", lines);
+            // keep the text readable on high-resolution Game views (e.g. QHD / 4K)
+            var scale = Mathf.Max(1f, Screen.height / 1080f);
+            var saved = GUI.matrix;
+            GUI.matrix = Matrix4x4.Scale(new Vector3(scale, scale, 1f));
             var size = _style.CalcSize(new GUIContent(text));
-            GUI.Box(new Rect(10, 10, size.x + 12, size.y + 8), text, _style);
+            if (GUI.Button(new Rect(10, 10, size.x + 12, size.y + 8), text, _style))   // click anywhere on it to open / close
+                overlayExpanded = !overlayExpanded;
+            GUI.matrix = saved;
         }
     }
 }

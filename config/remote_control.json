@@ -1,0 +1,16 @@
+{
+  "connector": {
+    "type": "websocket",
+    "host": "localhost",
+    "port": 8765,
+    "path": "/motion",
+    "listen_host": "0.0.0.0",
+    "tls": false,
+    "min_backoff": 0.5,
+    "max_backoff": 5.0
+  },
+  "heartbeat": {
+    "interval": 0.5,
+    "timeout": 2.0
+  }
+}

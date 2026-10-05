@@ -74,6 +74,39 @@ static class Program
         try { Envelope.FromJson("{\"v\":2,\"type\":\"x\",\"robot_id\":\"r\"}"); } catch (ProtocolException) { threw = true; }
         Check("rejects other protocol version", threw);
 
+        // ── system config file (shared with Python) ──
+        var ws = RemoteControlConfig.RobotTransportFromConfig(JObject.Parse(
+            "{\"connector\":{\"type\":\"websocket\",\"host\":\"10.1.2.3\",\"port\":9100,\"path\":\"/m\",\"listen_host\":\"0.0.0.0\"}}"));
+        Check("config websocket", ws is WebSocketRobotTransport && ws.Url == "ws://10.1.2.3:9100/m");
+        Environment.SetEnvironmentVariable("RC_TEST_PW", "s3cret");
+        var mq = RemoteControlConfig.RobotTransportFromConfig(JObject.Parse(
+            "{\"connector\":{\"type\":\"mqtt\",\"host\":\"b\",\"tls\":true,\"prefix\":\"lab/rc\",\"username\":\"u\",\"password_env\":\"RC_TEST_PW\",\"keepalive\":30}}")
+            is JObject j0 ? (JObject)RemoteControlConfig.ResolveEnv(j0) : null);
+        Check("config mqtt", mq is MqttRobotTransport && mq.Url == "mqtts://u@b:8883/lab/rc");
+        bool ros2Rejected = false;
+        try { RemoteControlConfig.RobotTransportFromConfig(JObject.Parse("{\"connector\":{\"type\":\"ros2\"}}")); }
+        catch (ConfigException e) { ros2Rejected = e.Message.Contains("not available in Unity"); }
+        Check("config ros2 rejected in Unity", ros2Rejected);
+        var saved = Environment.GetEnvironmentVariable(RemoteControlConfig.DirEnv);
+        Environment.SetEnvironmentVariable(RemoteControlConfig.DirEnv, null);
+        var userLevel = OperatingSystem.IsWindows() ? Environment.GetEnvironmentVariable(RemoteControlConfig.DirEnv, EnvironmentVariableTarget.User) : null;
+        if (string.IsNullOrEmpty(userLevel))
+        {
+            bool envNamed = false;
+            try { RemoteControlConfig.SystemConfigPath(); } catch (ConfigException e) { envNamed = e.Message.Contains("RC_CONFIG_DIR"); }
+            Check("missing RC_CONFIG_DIR is reported", envNamed);
+        }
+        else   // process copy cleared, but setx stored it for the user: the fallback must find it
+            Check("RC_CONFIG_DIR read from user settings when the process lacks it", RemoteControlConfig.ConfigDir() == userLevel);
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rc_cfg_" + Guid.NewGuid().ToString("N"));
+        System.IO.Directory.CreateDirectory(dir);
+        System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "remote_control.json"),
+            "{\"connector\":{\"type\":\"websocket\",\"host\":\"h\",\"port\":1234}}");
+        Environment.SetEnvironmentVariable(RemoteControlConfig.DirEnv, dir);
+        var sys = RemoteControlConfig.RobotTransportFromConfig(RemoteControlConfig.LoadSystemConfig());
+        Check("system config from RC_CONFIG_DIR", sys.Url == "ws://h:1234/motion");
+        Environment.SetEnvironmentVariable(RemoteControlConfig.DirEnv, saved);
+
         Console.WriteLine(fails == 0 ? "ALL PASS" : $"{fails} FAILED");
         return fails == 0 ? 0 : 1;
     }

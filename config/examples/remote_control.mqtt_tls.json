@@ -1,0 +1,18 @@
+{
+  "connector": {
+    "type": "mqtt",
+    "host": "broker.example.com",
+    "port": 8883,
+    "prefix": "robotmarket/rc",
+    "username": "robotmarket",
+    "password_env": "RC_MQTT_PASSWORD",
+    "tls": true,
+    "ca_certs": null,
+    "keepalive": 10,
+    "client_id": null
+  },
+  "heartbeat": {
+    "interval": 0.5,
+    "timeout": 2.0
+  }
+}

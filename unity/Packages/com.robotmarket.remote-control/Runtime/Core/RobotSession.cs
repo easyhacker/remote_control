@@ -50,9 +50,17 @@ namespace RobotMarket.RemoteControl
         public void Start() => Transport.Start();
 
         /// <summary>Advance by dt seconds: process incoming messages, move, heartbeat, send.</summary>
-        public void Update(double dt)
+        public void Update(double dt) => Update(dt, _now + dt);
+
+        /// <summary>
+        /// As Update(dt), but heartbeats and the connection watchdog follow <paramref name="clock"/> (seconds, wall
+        /// time). Simulators must pass real time here: their simulated time falls behind the wall clock whenever a
+        /// frame is slow (Unity caps each frame's physics at Time.maximumDeltaTime), and heartbeats paced by
+        /// simulated time then arrive too late for the controller's timeout.
+        /// </summary>
+        public void Update(double dt, double clock)
         {
-            _now += dt;
+            _now = clock;
             while (Transport.Poll(out var ev))
             {
                 switch (ev.Kind)

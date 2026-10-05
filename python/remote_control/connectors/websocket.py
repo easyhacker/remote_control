@@ -29,7 +29,7 @@ except ImportError:  # websockets 10–12
 from websockets.exceptions import ConnectionClosed
 
 from ..protocol import Channel, Envelope, ProtocolError
-from .base import ControllerTransport, Link, RobotTransport
+from .base import ControllerConnector, Link, RobotConnector
 
 log = logging.getLogger(__name__)
 MAX_FRAME = 16 * 1024 * 1024
@@ -94,7 +94,7 @@ class _WsLink(Link):
         await self.ws.close()
 
 
-class WebSocketControllerTransport(ControllerTransport):
+class WebSocketControllerConnector(ControllerConnector):
     """Listens on ws://host:port/path (host 0.0.0.0 to accept robots from other machines)."""
 
     def __init__(self, host: str = "0.0.0.0", port: int = 8765, path: str = "/motion") -> None:
@@ -137,7 +137,7 @@ class WebSocketControllerTransport(ControllerTransport):
 
 # ── robot side ───────────────────────────────────────────────────────────────
 
-class WebSocketRobotTransport(RobotTransport):
+class WebSocketRobotConnector(RobotConnector):
     """Connects to ws://host:port/path and reconnects with backoff (0.5 s → 5 s) after drops."""
 
     def __init__(self, url: str, min_backoff: float = 0.5, max_backoff: float = 5.0) -> None:

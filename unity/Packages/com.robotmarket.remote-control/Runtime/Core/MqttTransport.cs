@@ -22,14 +22,48 @@ using MQTTnet.Protocol;
 
 namespace RobotMarket.RemoteControl
 {
+    /// <summary>MQTT connection parameters (from a URL or the "connector" section of remote_control.json).</summary>
+    public sealed class MqttSettings
+    {
+        public string Host = "localhost";
+        public int Port;                 // 0 = 1883, or 8883 with TLS
+        public string Prefix = "rc";
+        public string Username;
+        public string Password;
+        public bool Tls;
+        public int KeepAlive = 10;
+        public string ClientId;          // null = rc-robot-<robot_id>
+
+        public int EffectivePort => Port > 0 ? Port : (Tls ? 8883 : 1883);
+
+        public static MqttSettings FromUrl(string url)
+        {
+            var u = new Uri(url);
+            var s = new MqttSettings { Tls = u.Scheme == "mqtts", Host = u.Host, Port = u.IsDefaultPort || u.Port <= 0 ? 0 : u.Port };
+            if (!string.IsNullOrEmpty(u.UserInfo))
+            {
+                var parts = u.UserInfo.Split(new[] { ':' }, 2);
+                s.Username = Uri.UnescapeDataString(parts[0]);
+                s.Password = parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : null;
+            }
+            var prefix = u.AbsolutePath.Trim('/');
+            s.Prefix = prefix.Length > 0 ? Uri.UnescapeDataString(prefix) : "rc";
+            return s;
+        }
+
+        /// <summary>Display form (no password).</summary>
+        public string ToUrl() =>
+            $"{(Tls ? "mqtts" : "mqtt")}://{(Username != null ? Username + "@" : "")}{Host}:{EffectivePort}/{Prefix}";
+    }
+
     public sealed class MqttRobotTransport : IRobotTransport
     {
         public const string ControllerPresence = "_controller";
         public string Url { get; }
         public double MinBackoff = 1.0, MaxBackoff = 5.0;
 
-        readonly string _host, _user, _pass, _prefix;
-        readonly int _port;
+        readonly string _host, _user, _pass, _prefix, _clientId;
+        readonly int _port, _keepAlive;
         readonly bool _tls;
         string _robotId, _tCmd, _tCtrl, _tStatus, _tOnline, _tPresence;
 
@@ -42,21 +76,19 @@ namespace RobotMarket.RemoteControl
         bool _brokerUp, _controllerUp;
         volatile bool _linked;
 
-        public MqttRobotTransport(string url)
+        public MqttRobotTransport(string url) : this(MqttSettings.FromUrl(url)) { }
+
+        public MqttRobotTransport(MqttSettings s)
         {
-            Url = url;
-            var u = new Uri(url);
-            _tls = u.Scheme == "mqtts";
-            _host = u.Host;
-            _port = u.IsDefaultPort || u.Port <= 0 ? (_tls ? 8883 : 1883) : u.Port;
-            if (!string.IsNullOrEmpty(u.UserInfo))
-            {
-                var parts = u.UserInfo.Split(new[] { ':' }, 2);
-                _user = Uri.UnescapeDataString(parts[0]);
-                _pass = parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : null;
-            }
-            var prefix = u.AbsolutePath.Trim('/');
-            _prefix = prefix.Length > 0 ? Uri.UnescapeDataString(prefix) : "rc";
+            Url = s.ToUrl();
+            _tls = s.Tls;
+            _host = s.Host;
+            _port = s.EffectivePort;
+            _user = s.Username;
+            _pass = s.Password;
+            _prefix = string.IsNullOrEmpty(s.Prefix) ? "rc" : s.Prefix.Trim('/');
+            _keepAlive = s.KeepAlive > 0 ? s.KeepAlive : 10;
+            _clientId = s.ClientId;
         }
 
         public bool Connected => _linked;
@@ -161,10 +193,10 @@ namespace RobotMarket.RemoteControl
 
                 var builder = new MqttClientOptionsBuilder()
                     .WithTcpServer(_host, _port)
-                    .WithClientId("rc-robot-" + _robotId)
+                    .WithClientId(_clientId ?? "rc-robot-" + _robotId)
                     .WithProtocolVersion(MqttProtocolVersion.V311)
                     .WithCleanSession(true)
-                    .WithKeepAlivePeriod(TimeSpan.FromSeconds(10))
+                    .WithKeepAlivePeriod(TimeSpan.FromSeconds(_keepAlive))
                     .WithTimeout(TimeSpan.FromSeconds(5))
                     .WithWillTopic(_tOnline)
                     .WithWillPayload(Encoding.UTF8.GetBytes("0"))

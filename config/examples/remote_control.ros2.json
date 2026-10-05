@@ -1,0 +1,11 @@
+{
+  "connector": {
+    "type": "ros2",
+    "namespace": "rc",
+    "domain_id": null
+  },
+  "heartbeat": {
+    "interval": 0.5,
+    "timeout": 2.0
+  }
+}

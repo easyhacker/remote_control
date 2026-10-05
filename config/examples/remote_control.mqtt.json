@@ -1,0 +1,18 @@
+{
+  "connector": {
+    "type": "mqtt",
+    "host": "127.0.0.1",
+    "port": 1883,
+    "prefix": "rc",
+    "username": null,
+    "password": null,
+    "tls": false,
+    "ca_certs": null,
+    "keepalive": 10,
+    "client_id": null
+  },
+  "heartbeat": {
+    "interval": 0.5,
+    "timeout": 2.0
+  }
+}

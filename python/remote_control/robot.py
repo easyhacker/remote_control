@@ -1,5 +1,5 @@
 """
-Robot-side runtime: binds a RobotTransport + MotionExecutor + JointDriver and runs the tick loop,
+Robot-side runtime: binds a RobotConnector + MotionExecutor + JointDriver and runs the tick loop,
 heartbeats and the connection watchdog. Used by the fake robot, tests and (later) the Isaac/ROS bridges.
 The Unity client (C#) implements the same behaviour in RemoteControlRobot.cs.
 """
@@ -12,16 +12,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .executor import JointDriver, MotionExecutor
 from .protocol import (PROTOCOL_VERSION, Envelope, MsgType, Sequencer, SeqTracker, channel_of)
-from .transports.base import RobotTransport
+from .connectors.base import RobotConnector
 
 log = logging.getLogger(__name__)
 
 
 class RobotRuntime:
-    def __init__(self, transport: RobotTransport, driver: JointDriver, robot_id: str,
+    def __init__(self, connector: RobotConnector, driver: JointDriver, robot_id: str,
                  name: str = "", tick_hz: float = 100.0, decel_time: float = 0.4,
                  software: str = "remote-control-py/0.1") -> None:
-        self.transport = transport
+        self.connector = connector
         self.driver = driver
         self.robot_id = robot_id
         self.name = name or robot_id
@@ -38,13 +38,17 @@ class RobotRuntime:
         self._last_hello = 0.0
         self.welcomed = False
         self._task: Optional["asyncio.Future"] = None
-        transport.on_connected = self._on_connected
-        transport.on_disconnected = self._on_disconnected
-        transport.on_message = self._on_message
-        transport.bind(robot_id)
+        connector.on_connected = self._on_connected
+        connector.on_disconnected = self._on_disconnected
+        connector.on_message = self._on_message
+        connector.bind(robot_id)
+
+    @property
+    def transport(self) -> RobotConnector:   # pre-0.3 name
+        return self.connector
 
     async def start(self) -> None:
-        await self.transport.start()
+        await self.connector.start()
         self._task = asyncio.ensure_future(self._loop())
 
     async def stop(self) -> None:
@@ -56,7 +60,7 @@ class RobotRuntime:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        await self.transport.stop()
+        await self.connector.stop()
 
     # ── outgoing ─────────────────────────────────────────────────────────────
 
@@ -65,11 +69,11 @@ class RobotRuntime:
 
     async def _flush(self) -> None:
         out, self._outbox = self._outbox, []
-        if not self.transport.connected:
+        if not self.connector.connected:
             return  # state is re-sent in hello on reconnect; results of finished goals are lost
         for msg_type, goal_id, payload in out:
             env = self._seq.stamp(Envelope(msg_type, self.robot_id, payload, goal_id))
-            await self.transport.send(env, channel_of(msg_type, from_robot=True))
+            await self.connector.send(env, channel_of(msg_type, from_robot=True))
 
     def hello_payload(self) -> Dict[str, Any]:
         return {
@@ -82,7 +86,7 @@ class RobotRuntime:
             "state": self.executor.state_payload(),
         }
 
-    # ── transport events ─────────────────────────────────────────────────────
+    # ── connector events ─────────────────────────────────────────────────────
 
     async def _on_connected(self) -> None:
         self._seq.reset()
@@ -127,7 +131,7 @@ class RobotRuntime:
             now = time.monotonic()
             self.executor.tick(now - last)
             last = now
-            if self.transport.connected:
+            if self.connector.connected:
                 if now - self._last_rx > self.heartbeat_timeout:
                     self.executor.pause_for("connection_lost")
                     if self.welcomed:  # controller lost us — announce again until welcomed

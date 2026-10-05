@@ -1,13 +1,13 @@
 """
-Transport adapters: how envelopes travel. The protocol and executor never depend on a concrete one.
+Connectors: how envelopes travel. The protocol and executor never depend on a concrete one.
 
-Controller side — one ControllerTransport serves many robots. Each connected peer is a Link;
+Controller side — one ControllerConnector serves many robots. Each connected peer is a Link;
 the controller learns a link's robot_id from its `hello`.
 
-Robot side — one RobotTransport keeps a single (auto-reconnecting) connection to the controller.
+Robot side — one RobotConnector keeps a single (auto-reconnecting) connection to the controller.
 
-To add a transport (MQTT, ROS 2, serial…): implement both classes and register a URL scheme in
-transports/__init__.py.
+To add a connector type (serial, cloud relay…): subclass both classes and register the type in
+connectors/__init__.py (name, URL schemes, and how to build it from a config section).
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ MessageHandler = Callable[[Envelope], Awaitable[None]]
 EventHandler = Callable[[], Awaitable[None]]
 
 
-class ControllerTransport(abc.ABC):
+class ControllerConnector(abc.ABC):
     def __init__(self) -> None:
         self.on_link_open: Optional[LinkHandler] = None
         self.on_link_closed: Optional[LinkHandler] = None
@@ -64,7 +64,7 @@ class ControllerTransport(abc.ABC):
             await self.on_message(link, env)
 
 
-class RobotTransport(abc.ABC):
+class RobotConnector(abc.ABC):
     def __init__(self) -> None:
         self.on_connected: Optional[EventHandler] = None
         self.on_disconnected: Optional[EventHandler] = None

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remote-control"
-version = "0.1.0"
+version = "0.3.0"
 description = "Transport-neutral motion protocol: send timed joint goals to robots/simulators, get reports, pause/resume/cancel/stop."
 requires-python = ">=3.8"
 dependencies = []

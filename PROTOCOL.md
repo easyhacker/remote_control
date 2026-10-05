@@ -192,13 +192,13 @@ After reconnecting, the robot sends a fresh `hello` that includes its current `s
 
 ## Transport mappings
 
-| | WebSocket | MQTT | ROS 2 (planned) |
+| | WebSocket | MQTT | ROS 2 |
 |---|---|---|---|
-| Address | Robot dials `ws://host:port/motion` | Both dial `mqtt://[user:pass@]broker:1883/<prefix>` (`mqtts://` for TLS) | `ros2://<namespace>` |
-| command | JSON text frame | `<prefix>/<robot_id>/cmd`, QoS 1 | `ExecuteMotion` action goal |
-| control | JSON text frame, handled ahead of goals | `<prefix>/<robot_id>/ctrl`, QoS 1 (heartbeats QoS 0) | action cancel + `pause` / `resume` / `stop` services |
-| status | JSON text frame | `<prefix>/<robot_id>/status`, QoS 1 (heartbeats QoS 0) | action feedback / result + `state` topic |
-| presence | the socket itself | `<prefix>/<robot_id>/online` and `<prefix>/_controller/online`: retained `"1"`, with `"0"` as last will | node graph |
+| Address | Robot dials `ws://host:port/motion` | Both dial `mqtt://[user:pass@]broker:1883/<prefix>` (`mqtts://` for TLS) | Both join `ros2://<namespace>[?domain=N]` |
+| command | JSON text frame | `<prefix>/<robot_id>/cmd`, QoS 1 | `/<ns>/<robot>/cmd` (`std_msgs/String`, reliable) |
+| control | JSON text frame, handled ahead of goals | `<prefix>/<robot_id>/ctrl`, QoS 1 (heartbeats QoS 0) | `/<ns>/<robot>/ctrl` |
+| status | JSON text frame | `<prefix>/<robot_id>/status`, QoS 1 (heartbeats QoS 0) | `/<ns>/<robot>/status` |
+| presence | the socket itself | `<prefix>/<robot_id>/online` and `<prefix>/_controller/online`: retained `"1"`, with `"0"` as last will | `/<ns>/<robot>/online` and `/<ns>/_controller/online`: transient-local `"1"`, plus ROS graph matching |
 
 ### MQTT details
 
@@ -210,3 +210,18 @@ After reconnecting, the robot sends a fresh `hello` that includes its current `s
   link when the robot's presence becomes `"0"`.
 - `robot_id` must be a valid topic level: no `/`, `+` or `#`, and not `_controller`.
 - One controller per prefix. Multiple controllers would need goal ownership, which v1 does not define.
+
+### ROS 2 details
+
+- Envelopes travel as JSON in `std_msgs/String`. No custom interfaces are used, so any ROS 2 install works
+  without a colcon build. QoS is reliable with keep-last 100. Presence topics are transient-local (latched).
+- `<robot>` in topic names is the `robot_id`, with characters ROS names don't allow replaced by `_` and an `r_`
+  prefix if it starts with a digit. The envelope always carries the real id.
+- ROS has no last will, so presence also comes from the graph. A robot is **connected** while the controller's presence is
+  `"1"` **and** the controller publishes to the robot's `cmd`/`ctrl` topics **and** subscribes to its `status`. Neither side
+  says hello until both directions are matched, so the first messages are not lost to DDS discovery.
+- The controller discovers robots by their `/<ns>/*/status` topics. It drops a robot when nothing publishes that topic any more.
+- This transport connects controllers and robots *over* ROS. Driving a ros2_control robot *from* a robot runtime is a
+  separate concern: the `Ros2JointDriver` streams position targets to a forward position controller or a
+  `joint_trajectory_controller` topic. Native interop for ROS clients (a `FollowJointTrajectory` action server in front
+  of the executor) is planned.

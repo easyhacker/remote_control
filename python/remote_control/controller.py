@@ -1,7 +1,8 @@
 """
 Controller-side API: the code that decides what robots do uses only this module.
 
-    controller = MotionController(controller_transport_from_url("ws://0.0.0.0:8765/motion"))
+    controller = MotionController(controller_connector_from_url("ws://0.0.0.0:8765/motion"))
+    # or: MotionController(controller_connector_from_config(load_config("controller.json")["connector"]))
     await controller.start()
     robot = await controller.wait_for_robot("arm-01")
     goal = await robot.execute(["shoulder", "elbow"],
@@ -20,7 +21,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from .protocol import (CONTROL_TYPES, Envelope, GoalStatus, MsgType, Sequencer, SeqTracker,
                        channel_of, new_goal_id)
 from .trajectory import Joint
-from .transports.base import ControllerTransport, Link
+from .connectors.base import ControllerConnector, Link
 
 log = logging.getLogger(__name__)
 
@@ -233,23 +234,27 @@ class _LinkInfo:
 class MotionController(_Events):
     """events: robot_online, robot_offline (payload: {"robot_id"})."""
 
-    def __init__(self, transport: ControllerTransport, heartbeat_interval: float = 0.5,
+    def __init__(self, connector: ControllerConnector, heartbeat_interval: float = 0.5,
                  heartbeat_timeout: float = 2.0) -> None:
         super().__init__()
-        self.transport = transport
+        self.connector = connector
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
         self.robots: Dict[str, RobotHandle] = {}
         self._links: Dict[str, _LinkInfo] = {}
         self._hb_task: Optional["asyncio.Future"] = None
         self._robot_online: Optional[asyncio.Condition] = None  # created in start() (needs a running loop on 3.8)
-        transport.on_link_open = self._on_open
-        transport.on_link_closed = self._on_closed
-        transport.on_message = self._on_message
+        connector.on_link_open = self._on_open
+        connector.on_link_closed = self._on_closed
+        connector.on_message = self._on_message
+
+    @property
+    def transport(self) -> ControllerConnector:   # pre-0.3 name
+        return self.connector
 
     async def start(self) -> None:
         self._robot_online = asyncio.Condition()
-        await self.transport.start()
+        await self.connector.start()
         self._hb_task = asyncio.ensure_future(self._heartbeat_loop())
 
     async def stop(self) -> None:
@@ -259,7 +264,7 @@ class MotionController(_Events):
                 await self._hb_task
             except asyncio.CancelledError:
                 pass
-        await self.transport.stop()
+        await self.connector.stop()
 
     async def wait_for_robot(self, robot_id: Optional[str] = None,
                              timeout: Optional[float] = None) -> RobotHandle:
@@ -277,7 +282,7 @@ class MotionController(_Events):
 
         return await asyncio.wait_for(wait(), timeout)
 
-    # ── transport events ─────────────────────────────────────────────────────
+    # ── connector events ─────────────────────────────────────────────────────
 
     async def _on_open(self, link: Link) -> None:
         self._links[link.id] = _LinkInfo(link)

@@ -1,11 +1,13 @@
 """
-Conformance tests: controller ↔ robot behaviour, run identically over every transport and robot
+Conformance tests: controller ↔ robot behaviour, run identically over every connector and robot
 implementation:
-  - LoopbackTransportTests   Python robot, in-process transport
-  - WebSocketTransportTests  Python robot over WebSocket
+  - LoopbackConnectorTests   Python robot, in-process connector
+  - WebSocketConnectorTests  Python robot over WebSocket
   - CSharpRobotTests         the Unity package's C# core (built with plain .NET) over WebSocket
-  - MqttTransportTests       Python robot over MQTT
+  - MqttConnectorTests       Python robot over MQTT
   - CSharpMqttRobotTests     the C# core over MQTT
+  - Ros2ConnectorTests       Python robot over ROS 2 (DDS)            — needs a sourced ROS 2 env (rclpy)
+  - Ros2DriverTests          Ros2JointDriver against a fake ros2_control robot
 
 MQTT tests use tools/mini_mqtt_broker.py, or a real broker if RC_MQTT_URL is set
 (e.g. RC_MQTT_URL=mqtt://localhost:1883 for Mosquitto).
@@ -29,8 +31,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 from remote_control import (FakeDriver, GoalRejected, Joint, MotionController, RobotRuntime,  # noqa: E402
                             Trajectory)
 from remote_control.protocol import SeqTracker  # noqa: E402
-from remote_control.transports.loopback import (LoopbackControllerTransport,  # noqa: E402
-                                                LoopbackRobotTransport)
+from remote_control.connectors.loopback import (LoopbackControllerConnector,  # noqa: E402
+                                                LoopbackRobotConnector)
 
 JOINTS = [   # the C# harness (Tests~/DotnetRobot/Program.cs) uses the same joints
     Joint("shoulder", "revolute", -3.0, 3.0, 4.0),
@@ -76,8 +78,138 @@ class TrajectoryTests(unittest.TestCase):
         self.assertFalse(s.accept(5))  # outside the window
 
 
+class UrdfTests(unittest.TestCase):
+    def test_urdf_limits(self):
+        import tempfile
+        from remote_control.urdf import load_urdf_joints
+        urdf = """<robot name="r">
+          <joint name="a" type="revolute"><limit lower="-1.5" upper="1.5" velocity="2.0" effort="1"/></joint>
+          <joint name="b" type="prismatic"><limit lower="0" upper="0.03" velocity="0.1" effort="1"/></joint>
+          <joint name="c" type="continuous"><limit velocity="3" effort="1"/></joint>
+          <joint name="f" type="fixed"/></robot>"""
+        with tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False) as f:
+            f.write(urdf)
+        try:
+            j = {x.name: x for x in load_urdf_joints(f.name)}
+            self.assertEqual(sorted(j), ["a", "b", "c"])
+            self.assertEqual((j["a"].lower, j["a"].upper, j["a"].max_velocity), (-1.5, 1.5, 2.0))
+            self.assertEqual(j["b"].type, "prismatic")
+            self.assertIsNone(j["c"].lower)
+            with self.assertRaises(ValueError):
+                load_urdf_joints(f.name, ["a", "zz"])
+        finally:
+            os.unlink(f.name)
+
+
+class ConnectorConfigTests(unittest.TestCase):
+    """Connector type and options come from configuration (URL, dict, or file)."""
+
+    def test_type_selects_connector_class(self):
+        from remote_control.connectors import controller_connector_from_config as ctrl
+        from remote_control.connectors import robot_connector_from_config as rob
+        self.assertEqual(type(rob({"type": "loopback", "name": "x"})).__name__, "LoopbackRobotConnector")
+        self.assertEqual(type(ctrl({"type": "loopback"})).__name__, "LoopbackControllerConnector")
+        if HAVE_WS:
+            r = rob({"type": "websocket", "host": "10.0.0.5", "port": 9000})
+            self.assertEqual((type(r).__name__, r.url), ("WebSocketRobotConnector", "ws://10.0.0.5:9000/motion"))
+            c = ctrl({"type": "ws", "port": 9001})
+            self.assertEqual((type(c).__name__, c.host, c.port), ("WebSocketControllerConnector", "0.0.0.0", 9001))
+        if HAVE_MQTT:
+            m = rob({"type": "mqtt", "host": "b", "prefix": "lab/rc", "tls": True, "client_id": "me"})
+            self.assertEqual(type(m).__name__, "MqttRobotConnector")
+            self.assertEqual((m.settings.host, m.settings.port, m.settings.prefix, m.settings.client_id),
+                             ("b", 8883, "lab/rc", "me"))
+        if HAVE_ROS2:
+            r2 = rob({"type": "ros2", "namespace": "lab/rc", "domain_id": 7})
+            self.assertEqual((r2.settings.namespace, r2.settings.domain_id), ("lab/rc", 7))
+
+    def test_url_or_type_and_errors(self):
+        from remote_control.connectors import ConfigError, robot_connector_from_config, robot_connector_from_url
+        self.assertEqual(type(robot_connector_from_config({"url": "loopback://abc"})).__name__, "LoopbackRobotConnector")
+        self.assertEqual(type(robot_connector_from_url("loopback://abc")).__name__, "LoopbackRobotConnector")
+        with self.assertRaises(ConfigError):
+            robot_connector_from_config({"type": "carrier-pigeon"})
+        with self.assertRaises(ConfigError):
+            robot_connector_from_config({"host": "x"})          # neither type nor url
+        if HAVE_MQTT:
+            m = robot_connector_from_config({"url": "mqtts://u:p@h:1234/a", "keepalive": 30})
+            self.assertEqual((m.settings.username, m.settings.password, m.settings.port, m.settings.keepalive),
+                             ("u", "p", 1234, 30))
+
+    def test_secrets_from_environment(self):
+        from remote_control.connectors.config import ConfigError, resolve_env
+        os.environ["RC_TEST_SECRET"] = "s3cret"
+        os.environ["RC_TEST_HOST"] = "broker.lan"
+        try:
+            cfg = resolve_env({"connector": {"type": "mqtt", "host": "${RC_TEST_HOST}", "password_env": "RC_TEST_SECRET"}})
+            self.assertEqual(cfg["connector"], {"type": "mqtt", "host": "broker.lan", "password": "s3cret"})
+            with self.assertRaises(ConfigError):
+                resolve_env({"password_env": "RC_TEST_DOES_NOT_EXIST"})
+        finally:
+            del os.environ["RC_TEST_SECRET"], os.environ["RC_TEST_HOST"]
+
+    def test_config_files(self):
+        import json, tempfile
+        from remote_control import load_config, robot_connector_from_config
+        d = tempfile.mkdtemp()
+        jp = os.path.join(d, "robot.json")
+        with open(jp, "w") as f:
+            json.dump({"robot_id": "r1", "connector": {"type": "loopback", "name": "n"}}, f)
+        self.assertEqual(load_config(jp)["robot_id"], "r1")
+        self.assertEqual(type(robot_connector_from_config(jp)).__name__, "LoopbackRobotConnector")   # path works too
+        try:
+            try:
+                import tomllib  # noqa: F401
+            except ImportError:
+                import tomli  # noqa: F401
+            tp = os.path.join(d, "robot.toml")
+            with open(tp, "w") as f:
+                f.write('robot_id = "r2"\n[connector]\ntype = "loopback"\nname = "t"\n')
+            self.assertEqual(load_config(tp)["connector"]["name"], "t")
+        except ImportError:
+            pass
+        config_dir = os.path.join(HERE, "..", "..", "config")
+        for folder in (config_dir, os.path.join(config_dir, "examples")):
+            for name in os.listdir(folder):
+                if name.endswith(".json"):
+                    with open(os.path.join(folder, name)) as f:
+                        self.assertIn("type", json.load(f)["connector"], name)
+
+    def test_system_config_comes_from_rc_config_dir(self):
+        import json, tempfile
+        from remote_control import (ConfigError, controller_connector_from_system_config, load_system_config,
+                                    robot_connector_from_system_config, system_config_path)
+        saved = os.environ.pop("RC_CONFIG_DIR", None)
+        try:
+            with self.assertRaises(ConfigError) as cm:
+                system_config_path()
+            self.assertIn("RC_CONFIG_DIR", str(cm.exception))
+            d = tempfile.mkdtemp()
+            os.environ["RC_CONFIG_DIR"] = d
+            with self.assertRaises(ConfigError) as cm:          # directory set, file missing
+                load_system_config()
+            self.assertIn("remote_control.json", str(cm.exception))
+            with open(os.path.join(d, "remote_control.json"), "w") as f:
+                json.dump({"connector": {"type": "loopback", "name": "sys"},
+                           "heartbeat": {"interval": 0.2, "timeout": 1.0}}, f)
+            self.assertEqual(load_system_config()["heartbeat"]["timeout"], 1.0)
+            self.assertEqual(robot_connector_from_system_config().name, "sys")
+            self.assertEqual(controller_connector_from_system_config().name, "sys")
+            if HAVE_WS:   # one file serves both sides: robots dial `host`, the controller binds `listen_host`
+                from remote_control import controller_connector_from_config, robot_connector_from_config
+                ws = {"type": "websocket", "host": "10.1.2.3", "port": 9100, "listen_host": "127.0.0.1"}
+                self.assertEqual(robot_connector_from_config(ws).url, "ws://10.1.2.3:9100/motion")
+                c = controller_connector_from_config(ws)
+                self.assertEqual((c.host, c.port), ("127.0.0.1", 9100))
+        finally:
+            if saved is None:
+                os.environ.pop("RC_CONFIG_DIR", None)
+            else:
+                os.environ["RC_CONFIG_DIR"] = saved
+
+
 class _Conformance:
-    """Mixed into a TestCase per transport / robot implementation.
+    """Mixed into a TestCase per connector / robot implementation.
 
     Positions are read from protocol messages (results, feedback, state) only, so the tests work
     for robots running in another process or language.
@@ -87,7 +219,7 @@ class _Conformance:
         """Start the robot side; return an object with an async stop()."""
         raise NotImplementedError
 
-    async def make_controller_transport(self):
+    async def make_controller_connector(self):
         raise NotImplementedError
 
     async def drop_link(self):
@@ -95,7 +227,7 @@ class _Conformance:
         await self.robot._link.close()
 
     async def asyncSetUp(self):
-        self.controller = MotionController(await self.make_controller_transport(),
+        self.controller = MotionController(await self.make_controller_connector(),
                                            heartbeat_interval=0.1, heartbeat_timeout=0.5)
         await self.controller.start()
         self.robot_side = await self.start_robot(self.controller)
@@ -137,7 +269,7 @@ class _Conformance:
         result = await goal.result(timeout=3)
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual([p["point_index"] for p in goal.points_reached], [0, 1])
-        self.assertLess(goal.points_reached[0]["max_error"], 0.05)  # measured on the tick that passes the point
+        self.assertLess(goal.points_reached[0]["max_error"], 0.1)   # measured on the tick that passes the point (Windows timers ~15 ms)
         self.assertIsNotNone(goal.last_feedback)
         self.assertAlmostEqual(result["positions"][0], 1.0)
         self.assertAlmostEqual(result["positions"][1], 0.2)
@@ -251,9 +383,9 @@ class _Conformance:
 
 
 class _PythonRobot:
-    def __init__(self, transport):
-        self.transport = transport
-        self.runtime = RobotRuntime(transport, FakeDriver(JOINTS), ROBOT_ID, tick_hz=200, decel_time=0.1)
+    def __init__(self, connector):
+        self.connector = connector
+        self.runtime = RobotRuntime(connector, FakeDriver(JOINTS), ROBOT_ID, tick_hz=200, decel_time=0.1)
 
     async def start(self):
         await self.runtime.start()
@@ -263,16 +395,16 @@ class _PythonRobot:
         await self.runtime.stop()
 
 
-class LoopbackTransportTests(_Conformance, unittest.IsolatedAsyncioTestCase):
-    async def make_controller_transport(self):
+class LoopbackConnectorTests(_Conformance, unittest.IsolatedAsyncioTestCase):
+    async def make_controller_connector(self):
         self.name = f"t{id(self)}"
-        return LoopbackControllerTransport(self.name)
+        return LoopbackControllerConnector(self.name)
 
     async def start_robot(self, controller):
-        return await _PythonRobot(LoopbackRobotTransport(self.name, reconnect_delay=0.05)).start()
+        return await _PythonRobot(LoopbackRobotConnector(self.name, reconnect_delay=0.05)).start()
 
     async def drop_link(self):
-        self.robot_side.transport.simulate_drop(offline_for=0.2)
+        self.robot_side.connector.simulate_drop(offline_for=0.2)
 
 
 try:
@@ -283,9 +415,9 @@ except ImportError:
 
 
 class _WebSocketController:
-    async def make_controller_transport(self):
-        from remote_control.transports.websocket import WebSocketControllerTransport
-        ctrl = WebSocketControllerTransport("127.0.0.1", 0, "/motion")
+    async def make_controller_connector(self):
+        from remote_control.connectors.websocket import WebSocketControllerConnector
+        ctrl = WebSocketControllerConnector("127.0.0.1", 0, "/motion")
         await ctrl.start()          # bind now to learn the port …
         ctrl.start = _noop          # … so MotionController.start() doesn't bind again
         self.url = f"ws://127.0.0.1:{ctrl.bound_port}/motion"
@@ -293,10 +425,10 @@ class _WebSocketController:
 
 
 @unittest.skipUnless(HAVE_WS, "websockets not installed")
-class WebSocketTransportTests(_WebSocketController, _Conformance, unittest.IsolatedAsyncioTestCase):
+class WebSocketConnectorTests(_WebSocketController, _Conformance, unittest.IsolatedAsyncioTestCase):
     async def start_robot(self, controller):
-        from remote_control.transports.websocket import WebSocketRobotTransport
-        return await _PythonRobot(WebSocketRobotTransport(self.url, min_backoff=0.1)).start()
+        from remote_control.connectors.websocket import WebSocketRobotConnector
+        return await _PythonRobot(WebSocketRobotConnector(self.url, min_backoff=0.1)).start()
 
 
 class _DotnetRobot:
@@ -345,8 +477,8 @@ except ImportError:
 class _MqttBroker:
     """Each test gets its own topic prefix; the mini broker is started per test unless RC_MQTT_URL is set."""
 
-    async def make_controller_transport(self):
-        from remote_control.transports.mqtt import MqttControllerTransport
+    async def make_controller_connector(self):
+        from remote_control.connectors.mqtt import MqttControllerConnector
         prefix = f"rctest{uuid.uuid4().hex[:8]}"
         base = os.environ.get("RC_MQTT_URL")
         if base:
@@ -357,7 +489,7 @@ class _MqttBroker:
             self.broker = MiniBroker(port=0)
             await self.broker.start()
             self.url = f"mqtt://127.0.0.1:{self.broker.port}/{prefix}"
-        return MqttControllerTransport(self.url)
+        return MqttControllerConnector(self.url)
 
     async def asyncTearDown(self):
         await super().asyncTearDown()
@@ -372,10 +504,27 @@ class _MqttBroker:
 
 
 @unittest.skipUnless(HAVE_MQTT, "paho-mqtt not installed")
-class MqttTransportTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
+class MqttConnectorTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
     async def start_robot(self, controller):
-        from remote_control.transports.mqtt import MqttRobotTransport
-        return await _PythonRobot(MqttRobotTransport(self.url)).start()
+        from remote_control.connectors.mqtt import MqttRobotConnector
+        return await _PythonRobot(MqttRobotConnector(self.url)).start()
+
+
+@unittest.skipUnless(HAVE_MQTT, "paho-mqtt not installed")
+class MqttFromConfigTests(MqttConnectorTests):
+    """Same conformance suite, but both sides built from config sections instead of URLs."""
+
+    async def make_controller_connector(self):
+        from remote_control import controller_connector_from_config
+        await super().make_controller_connector()            # starts the broker, sets self.url
+        from urllib.parse import urlparse
+        u = urlparse(self.url)
+        self.cfg = {"type": "mqtt", "host": u.hostname, "port": u.port, "prefix": u.path.strip("/")}
+        return controller_connector_from_config({"connector": dict(self.cfg)})
+
+    async def start_robot(self, controller):
+        from remote_control import robot_connector_from_config
+        return await _PythonRobot(robot_connector_from_config(dict(self.cfg))).start()
 
 
 @unittest.skipUnless(HAVE_MQTT and shutil.which("dotnet") and os.path.isdir(DOTNET_PROJECT),
@@ -387,6 +536,121 @@ class CSharpMqttRobotTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTe
 
     async def start_robot(self, controller):
         return _DotnetRobot(self.url)
+
+
+try:
+    import rclpy  # noqa: F401
+    HAVE_ROS2 = True
+except ImportError:
+    HAVE_ROS2 = False
+
+
+@unittest.skipUnless(HAVE_ROS2, "needs rclpy (source ROS 2's local_setup first)")
+class Ros2ConnectorTests(_Conformance, unittest.IsolatedAsyncioTestCase):
+    async def make_controller_connector(self):
+        from remote_control.connectors.ros2 import Ros2ControllerConnector
+        self.url = f"ros2://rctest{uuid.uuid4().hex[:8]}"
+        return Ros2ControllerConnector(self.url)
+
+    async def start_robot(self, controller):
+        from remote_control.connectors.ros2 import Ros2RobotConnector
+        return await _PythonRobot(Ros2RobotConnector(self.url)).start()
+
+    async def drop_link(self):   # the robot's ROS node disappears (crash / network) and comes back
+        await self.robot_side.connector.simulate_drop(offline_for=0.3)
+
+
+class _FakeRos2Robot:
+    """A pretend ros2_control robot: tracks commands instantly and publishes /joint_states at 100 Hz."""
+
+    def __init__(self, ns, initial, command_type):
+        import threading
+        import rclpy
+        from rclpy.context import Context
+        from rclpy.executors import SingleThreadedExecutor
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import Float64MultiArray
+        from trajectory_msgs.msg import JointTrajectory
+        self.positions = dict(initial)
+        self.commands = 0
+        self.ctx = Context()
+        rclpy.init(context=self.ctx)
+        self.node = rclpy.create_node("fake_ros2_control", context=self.ctx)
+        names = list(initial)
+        if command_type == "position":
+            def on_cmd(msg):
+                self.commands += 1
+                self.positions.update(zip(names, msg.data))
+            self.node.create_subscription(Float64MultiArray, f"/{ns}/arm_position_controller/commands", on_cmd, 10)
+        else:
+            def on_traj(msg):
+                self.commands += 1
+                self.positions.update(zip(msg.joint_names, msg.points[-1].positions))
+            self.node.create_subscription(JointTrajectory, f"/{ns}/arm_controller/joint_trajectory", on_traj, 10)
+        pub = self.node.create_publisher(JointState, f"/{ns}/joint_states", 10)
+
+        def publish():
+            msg = JointState(name=list(self.positions), position=list(self.positions.values()))
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            pub.publish(msg)
+        self.node.create_timer(0.01, publish)
+        self._ex = SingleThreadedExecutor(context=self.ctx)
+        self._ex.add_node(self.node)
+        self._running = True
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _spin(self):
+        while self._running and self.ctx.ok():
+            self._ex.spin_once(timeout_sec=0.02)
+
+    def close(self):
+        import rclpy
+        self._running = False
+        self._thread.join(2)
+        self._ex.shutdown(timeout_sec=1)
+        self.node.destroy_node()
+        rclpy.shutdown(context=self.ctx)
+
+
+@unittest.skipUnless(HAVE_ROS2, "needs rclpy (source ROS 2's local_setup first)")
+class Ros2DriverTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, command_type):
+        from remote_control.drivers.ros2 import Ros2JointDriver
+        ns = f"rcdrv{uuid.uuid4().hex[:8]}"
+        hw = _FakeRos2Robot(ns, {"shoulder": 0.0, "elbow": 0.0, "slide": 0.2}, command_type)
+        topic = (f"/{ns}/arm_position_controller/commands" if command_type == "position"
+                 else f"/{ns}/arm_controller/joint_trajectory")
+        driver = Ros2JointDriver(JOINTS, topic, command_type=command_type, joint_state_topic=f"/{ns}/joint_states")
+        name = f"drv{id(self)}"
+        controller = MotionController(LoopbackControllerConnector(name), heartbeat_interval=0.1, heartbeat_timeout=0.5)
+        runtime = RobotRuntime(LoopbackRobotConnector(name), driver, ROBOT_ID, tick_hz=100, decel_time=0.1)
+        try:
+            self.assertTrue(await asyncio.get_event_loop().run_in_executor(None, driver.wait_ready, 10))
+            await controller.start()
+            await runtime.start()
+            robot = await controller.wait_for_robot(ROBOT_ID, timeout=5)
+            self.assertAlmostEqual(robot.state["positions"]["slide"], 0.2)
+            goal = await robot.execute(["shoulder", "elbow"], [([1.0, -0.5], 0.5)], report="points")
+            result = await goal.result(timeout=5)
+            self.assertEqual(result["status"], "succeeded")
+            await asyncio.sleep(0.1)
+            self.assertAlmostEqual(hw.positions["shoulder"], 1.0, places=3)
+            self.assertAlmostEqual(hw.positions["elbow"], -0.5, places=3)
+            self.assertAlmostEqual(hw.positions["slide"], 0.2, places=6)   # held at its measured position
+            self.assertGreater(hw.commands, 20)                             # streamed every tick
+            self.assertLess(goal.points_reached[0]["max_error"], 0.1)
+        finally:
+            await runtime.stop()
+            await controller.stop()
+            driver.close()
+            hw.close()
+
+    async def test_forward_position_controller(self):
+        await self._run("position")
+
+    async def test_joint_trajectory_topic(self):
+        await self._run("trajectory")
 
 
 async def _noop():

@@ -1,8 +1,11 @@
 """
 MQTT transport: robot and controller both connect out to a broker.
 
-URL:  mqtt://[user:pass@]host[:1883]/<prefix>     mqtts:// for TLS (default port 8883)
-      The path is the topic prefix (default "rc"), e.g. mqtt://broker.local/robotmarket/rc
+Configure with a URL —  mqtt://[user:pass@]host[:1883]/<prefix>   (mqtts:// for TLS, default port 8883)
+or a config section (see connectors/config.py):
+      {"type": "mqtt", "host": "broker.local", "port": 1883, "prefix": "rc",
+       "username": "robot", "password_env": "RC_MQTT_PASSWORD", "tls": false, "ca_certs": null,
+       "keepalive": 10, "client_id": null}
 
 Topics (QoS 1 unless noted):
   <prefix>/<robot_id>/cmd             controller → robot   goals            (COMMAND channel)
@@ -11,7 +14,7 @@ Topics (QoS 1 unless noted):
   <prefix>/<robot_id>/online          retained "1" / "0"   robot presence; "0" is the robot's last will
   <prefix>/_controller/online         retained "1" / "0"   controller presence; "0" is its last will
 
-A robot counts as *connected* (RobotTransport.connected) only while it is connected to the broker AND the
+A robot counts as *connected* (RobotConnector.connected) only while it is connected to the broker AND the
 controller's presence is "1" — so it pauses and re-announces itself exactly as it would over WebSocket.
 Heartbeats use QoS 0. Commands and controls use separate topics, so a pause is never queued behind a goal.
 
@@ -23,13 +26,14 @@ import asyncio
 import logging
 import ssl
 import uuid
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 import paho.mqtt.client as mqtt
 
 from ..protocol import Channel, Envelope, MsgType, ProtocolError
-from .base import ControllerTransport, Link, RobotTransport
+from .base import ControllerConnector, Link, RobotConnector
 
 log = logging.getLogger(__name__)
 
@@ -38,17 +42,53 @@ DEFAULT_PREFIX = "rc"
 KEEPALIVE = 10
 
 
-class MqttUrl:
-    def __init__(self, url: str) -> None:
+@dataclass
+class MqttSettings:
+    host: str = "localhost"
+    port: Optional[int] = None          # default 1883, or 8883 with TLS
+    prefix: str = DEFAULT_PREFIX
+    username: Optional[str] = None
+    password: Optional[str] = None
+    tls: bool = False
+    ca_certs: Optional[str] = None      # CA bundle for TLS; None = system trust store
+    keepalive: int = KEEPALIVE
+    client_id: Optional[str] = None     # default rc-robot-<robot_id> / rc-controller-<random>
+
+    def __post_init__(self) -> None:
+        if self.port is None:
+            self.port = 8883 if self.tls else 1883
+        self.prefix = self.prefix.strip("/") or DEFAULT_PREFIX
+
+    @classmethod
+    def from_url(cls, url: str) -> "MqttSettings":
         u = urlparse(url)
         if u.scheme not in ("mqtt", "mqtts"):
             raise ValueError(f"not an mqtt:// URL: {url}")
-        self.tls = u.scheme == "mqtts"
-        self.host = u.hostname or "localhost"
-        self.port = u.port or (8883 if self.tls else 1883)
-        self.username = unquote(u.username) if u.username else None
-        self.password = unquote(u.password) if u.password else None
-        self.prefix = u.path.strip("/") or DEFAULT_PREFIX
+        return cls(host=u.hostname or "localhost", port=u.port, prefix=u.path.strip("/") or DEFAULT_PREFIX,
+                   username=unquote(u.username) if u.username else None,
+                   password=unquote(u.password) if u.password else None, tls=u.scheme == "mqtts")
+
+    @classmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "MqttSettings":
+        if cfg.get("url"):
+            s = cls.from_url(cfg["url"])
+            for k in ("ca_certs", "keepalive", "client_id"):
+                if cfg.get(k) is not None:
+                    setattr(s, k, cfg[k])
+            return s
+        known = {"host", "port", "prefix", "username", "password", "tls", "ca_certs", "keepalive", "client_id"}
+        return cls(**{k: v for k, v in cfg.items() if k in known})
+
+    @classmethod
+    def coerce(cls, value: Union[str, "MqttSettings", Dict[str, Any]]) -> "MqttSettings":
+        if isinstance(value, MqttSettings):
+            return value
+        if isinstance(value, dict):
+            return cls.from_config(value)
+        return cls.from_url(value)
+
+
+MqttUrl = MqttSettings.from_url   # pre-0.3 name
 
 
 def _check_level(name: str, what: str) -> None:
@@ -61,7 +101,7 @@ class _Client:
 
     Event = Tuple[str, str, bytes]    # (kind, topic, payload); kind: connected | disconnected | message
 
-    def __init__(self, url: MqttUrl, client_id: str, will_topic: str, subscriptions: List[str],
+    def __init__(self, url: MqttSettings, client_id: str, will_topic: str, subscriptions: List[str],
                  on_event: Callable[["_Client.Event"], Awaitable[None]]) -> None:
         self.url = url
         self.will_topic = will_topic
@@ -76,7 +116,7 @@ class _Client:
         if url.username:
             c.username_pw_set(url.username, url.password)
         if url.tls:
-            c.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+            c.tls_set(ca_certs=url.ca_certs, cert_reqs=ssl.CERT_REQUIRED)
         c.will_set(will_topic, b"0", qos=1, retain=True)
         c.reconnect_delay_set(min_delay=1, max_delay=5)
         c.on_connect = self._paho_connect
@@ -114,7 +154,7 @@ class _Client:
 
     def start(self) -> None:
         self._pump = asyncio.ensure_future(self._run_pump())
-        self.client.connect_async(self.url.host, self.url.port, keepalive=KEEPALIVE)
+        self.client.connect_async(self.url.host, self.url.port, keepalive=self.url.keepalive)
         self.client.loop_start()
 
     async def stop(self) -> None:
@@ -147,10 +187,10 @@ def _decode(payload: bytes) -> Optional[Envelope]:
 
 # ── robot side ───────────────────────────────────────────────────────────────
 
-class MqttRobotTransport(RobotTransport):
-    def __init__(self, url: str) -> None:
+class MqttRobotConnector(RobotConnector):
+    def __init__(self, settings: Union[str, MqttSettings, Dict[str, Any]]) -> None:
         super().__init__()
-        self.url = MqttUrl(url)
+        self.url = self.settings = MqttSettings.coerce(settings)
         self._client: Optional[_Client] = None
         self._broker_up = False
         self._controller_up = False
@@ -165,11 +205,11 @@ class MqttRobotTransport(RobotTransport):
 
     async def start(self) -> None:
         if not self.robot_id:
-            raise RuntimeError("MqttRobotTransport needs bind(robot_id) before start()")
+            raise RuntimeError("MqttRobotConnector needs bind(robot_id) before start()")
         _check_level(self.robot_id, "robot_id")
         self._presence = f"{self.url.prefix}/{CONTROLLER_PRESENCE}/online"
         self._inbound = {self._topic("cmd"), self._topic("ctrl")}
-        self._client = _Client(self.url, f"rc-robot-{self.robot_id}", self._topic("online"),
+        self._client = _Client(self.url, self.url.client_id or f"rc-robot-{self.robot_id}", self._topic("online"),
                                [self._topic("cmd"), self._topic("ctrl"), self._presence], self._on_event)
         self._client.start()
 
@@ -209,7 +249,7 @@ class MqttRobotTransport(RobotTransport):
 # ── controller side ──────────────────────────────────────────────────────────
 
 class _MqttLink(Link):
-    def __init__(self, transport: "MqttControllerTransport", robot_id: str) -> None:
+    def __init__(self, transport: "MqttControllerConnector", robot_id: str) -> None:
         self.id = f"mqtt-{robot_id}"
         self.robot_id = robot_id
         self._t = transport
@@ -228,16 +268,16 @@ class _MqttLink(Link):
         await self._t._drop_link(self.robot_id)
 
 
-class MqttControllerTransport(ControllerTransport):
-    def __init__(self, url: str) -> None:
+class MqttControllerConnector(ControllerConnector):
+    def __init__(self, settings: Union[str, MqttSettings, Dict[str, Any]]) -> None:
         super().__init__()
-        self.url = MqttUrl(url)
+        self.url = self.settings = MqttSettings.coerce(settings)
         self._client: Optional[_Client] = None
         self._links: Dict[str, _MqttLink] = {}
 
     async def start(self) -> None:
         p = self.url.prefix
-        self._client = _Client(self.url, f"rc-controller-{uuid.uuid4().hex[:8]}",
+        self._client = _Client(self.url, self.url.client_id or f"rc-controller-{uuid.uuid4().hex[:8]}",
                                f"{p}/{CONTROLLER_PRESENCE}/online",
                                [f"{p}/+/status", f"{p}/+/online"], self._on_event)
         self._client.start()

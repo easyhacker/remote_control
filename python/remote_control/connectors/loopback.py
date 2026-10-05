@@ -11,9 +11,9 @@ import itertools
 from typing import Dict, Optional
 
 from ..protocol import Channel, Envelope
-from .base import ControllerTransport, Link, RobotTransport
+from .base import ControllerConnector, Link, RobotConnector
 
-_controllers: Dict[str, "LoopbackControllerTransport"] = {}
+_controllers: Dict[str, "LoopbackControllerConnector"] = {}
 _ids = itertools.count(1)
 
 
@@ -44,7 +44,7 @@ class _Pump:
 
 
 class _LoopLink(Link):
-    def __init__(self, robot: "LoopbackRobotTransport") -> None:
+    def __init__(self, robot: "LoopbackRobotConnector") -> None:
         self.id = f"loop-{next(_ids)}"
         self._robot = robot
 
@@ -55,7 +55,7 @@ class _LoopLink(Link):
         self._robot.simulate_drop(0.0)
 
 
-class LoopbackControllerTransport(ControllerTransport):
+class LoopbackControllerConnector(ControllerConnector):
     def __init__(self, name: str = "default") -> None:
         super().__init__()
         self.name = name
@@ -68,7 +68,7 @@ class LoopbackControllerTransport(ControllerTransport):
             del _controllers[self.name]
 
 
-class LoopbackRobotTransport(RobotTransport):
+class LoopbackRobotConnector(RobotConnector):
     def __init__(self, name: str = "default", reconnect_delay: float = 0.1) -> None:
         super().__init__()
         self.name = name
@@ -76,7 +76,7 @@ class LoopbackRobotTransport(RobotTransport):
         self._link: Optional[_LoopLink] = None
         self._to_ctrl: Optional[_Pump] = None
         self._to_robot: Optional[_Pump] = None
-        self._drop = asyncio.Event()
+        self._drop: Optional[asyncio.Event] = None   # created in start(): needs a running loop on 3.8
         self._offline_for = 0.0
         self._task: Optional["asyncio.Future"] = None
 
@@ -85,6 +85,7 @@ class LoopbackRobotTransport(RobotTransport):
         return self._link is not None
 
     async def start(self) -> None:
+        self._drop = asyncio.Event()
         self._task = asyncio.ensure_future(self._run())
 
     async def stop(self) -> None:
@@ -98,7 +99,8 @@ class LoopbackRobotTransport(RobotTransport):
     def simulate_drop(self, offline_for: float = 0.5) -> None:
         """Break the link; reconnect after `offline_for` seconds."""
         self._offline_for = offline_for
-        self._drop.set()
+        if self._drop is not None:
+            self._drop.set()
 
     async def send(self, env: Envelope, channel: Channel) -> None:
         if self._to_ctrl is not None:

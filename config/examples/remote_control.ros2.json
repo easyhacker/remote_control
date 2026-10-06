@@ -1,4 +1,5 @@
 {
+  "data_dir": "../data",
   "connector": {
     "type": "ros2",
     "namespace": "rc",

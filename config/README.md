@@ -15,6 +15,7 @@ parameters. To switch, copy one of `examples/remote_control.*.json` over it, or 
 
 | Type | Parameter | Default | Meaning |
 |---|---|---|---|
+| all | `data_dir` | none | where the controller stores robot data: `<data_dir>/<project>/<stage>/<robot>/description.json` and `poses.json`. A relative path is relative to this folder (`../data` = the repository's `data/`) |
 | all | `heartbeat.interval` / `heartbeat.timeout` | 0.5 / 2.0 s | how often both sides send heartbeats / silence before a link counts as lost (the controller sends these values to every robot) |
 | `websocket` | `host` | `localhost` | address robots connect to (the controller's machine) |
 | | `port` | 8765 | TCP port |

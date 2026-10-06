@@ -2,7 +2,7 @@
 A pretend robot (perfect tracking) for trying the controller without Unity.
 
     python examples/fake_robot.py                                   # connector from %RC_CONFIG_DIR%\remote_control.json
-    python examples/fake_robot.py --id arm-02
+    python examples/fake_robot.py --id arm-02 --project demo --stage bench
     python examples/fake_robot.py --url ws://192.168.1.10:8765/motion  # explicit override, ignores the file
 """
 import argparse
@@ -16,7 +16,10 @@ if hasattr(sys.stdout, "reconfigure"):  # Windows consoles default to cp1252
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from remote_control import (ConfigError, FakeDriver, Joint, RobotRuntime, load_system_config,  # noqa: E402
-                            robot_connector_from_config, robot_connector_from_url, system_config_path)
+                            load_urdf_tree, robot_connector_from_config, robot_connector_from_url,
+                            system_config_path)
+
+DEMO_URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_arm.urdf")
 
 JOINTS = [
     Joint("shoulder_yaw", "revolute", -2.97, 2.97, 2.0),
@@ -39,6 +42,9 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=None, help="connector URL, overriding the config file (%%RC_CONFIG_DIR%%\\remote_control.json)")
     ap.add_argument("--id", default="fake-arm", help="robot_id")
+    ap.add_argument("--project", default="demo", help="project name reported to the controller")
+    ap.add_argument("--stage", default="fake", help="stage name reported to the controller")
+    ap.add_argument("--urdf", default=DEMO_URDF, help="kinematic tree for describe (joint names must match)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -53,7 +59,8 @@ async def main():
         print(f"config: {system_config_path()}")
         connector = robot_connector_from_config(config)
         args.url = describe(config["connector"])
-    runtime = RobotRuntime(connector, FakeDriver(JOINTS), args.id, name="Fake arm")
+    runtime = RobotRuntime(connector, FakeDriver(JOINTS), args.id, name="Fake arm", project=args.project,
+                           stage=args.stage, tree=load_urdf_tree(args.urdf) if args.urdf else None)
     last = {}
 
     def on_state():
@@ -64,7 +71,7 @@ async def main():
             print(f"state={st['state']} goal={st['goal_id']} reason={st['pause_reason']}")
 
     await runtime.start()
-    print(f"fake robot '{args.id}' → {args.url}  (Ctrl+C to quit)")
+    print(f"fake robot '{args.id}' in {args.project} / {args.stage} → {args.url}  (Ctrl+C to quit)")
     try:
         while True:
             await asyncio.sleep(0.05)

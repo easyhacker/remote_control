@@ -1,4 +1,5 @@
 {
+  "data_dir": "D:\\Dev\\remote_control\\data",
   "connector": {
     "type": "websocket",
     "host": "localhost",

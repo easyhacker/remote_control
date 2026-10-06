@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv*/
 *.egg-info/
+python/build/
 
 # .NET harness
 **/Tests~/**/bin/
@@ -20,3 +21,6 @@ unity/*.csproj
 unity/*.sln
 unity/.vs/
 *.log
+
+# Robot data (descriptions, saved poses): local to each machine
+/data/

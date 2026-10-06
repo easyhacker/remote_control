@@ -47,6 +47,7 @@ namespace RobotMarket.RemoteControl.Unity
 
         readonly List<Entry> _entries = new List<Entry>();
         readonly Dictionary<string, Entry> _byName = new Dictionary<string, Entry>();
+        readonly Dictionary<ArticulationBody, Entry> _byBody = new Dictionary<ArticulationBody, Entry>();
         readonly List<Joint> _joints = new List<Joint>();
 
         // Used when a joint's drive has no stiffness (e.g. robots whose importer sets gains only at runtime):
@@ -110,6 +111,7 @@ namespace RobotMarket.RemoteControl.Unity
                 var e = new Entry { Body = body, Joint = joint, Revolute = revolute };
                 _entries.Add(e);
                 _byName[name] = e;
+                _byBody[body] = e;
                 _joints.Add(joint);
             }
             if (gainsApplied > 0)
@@ -118,6 +120,9 @@ namespace RobotMarket.RemoteControl.Unity
         }
 
         public IReadOnlyList<Joint> Joints => _joints;
+
+        /// <summary>The commandable joint driven by this body, or null (fixed / unsupported joints).</summary>
+        public Joint JointOf(ArticulationBody body) => body != null && _byBody.TryGetValue(body, out var e) ? e.Joint : null;
 
         void WriteTrace()
         {

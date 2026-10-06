@@ -27,8 +27,23 @@ namespace RobotMarket.RemoteControl.Unity
         public ConnectionSource connectionSource = ConnectionSource.ConfigFile;
         [Tooltip("Used when Connection Source = Controller Url: ws://host:8765/motion, or mqtt://[user:pass@]broker:1883/<prefix>")]
         public string controllerUrl = "ws://localhost:8765/motion";
-        public string robotId = "unity-arm";
-        public string displayName = "Unity arm";
+        [Tooltip("Identifies this robot to the controller (and names its data folder). Empty = the GameObject name")]
+        public string robotId = "";
+        [Tooltip("Human-readable name shown by the controller. Empty = the robot id")]
+        public string displayName = "";
+
+        /// <summary>Robot id actually used: the Robot Id field, else the GameObject name.</summary>
+        public string RobotId => !string.IsNullOrWhiteSpace(robotId) ? robotId.Trim() : gameObject.name;
+
+        /// <summary>Display name actually used: the Display Name field, else the robot id.</summary>
+        public string DisplayName => !string.IsNullOrWhiteSpace(displayName) ? displayName.Trim() : RobotId;
+
+        [Header("Data names")]
+        [Tooltip("Project name reported to the controller, which files this robot's data (description, saved poses) " +
+                 "under <data_dir>/<project>/<stage>/<robot id>. Empty = the Unity project's folder name")]
+        public string projectName = "";
+        [Tooltip("Stage name reported to the controller. Empty = the name of the scene this robot is in")]
+        public string stageName = "";
 
         [Header("Joints")]
         [Tooltip("Root of the articulation; defaults to this GameObject's ArticulationBody")]
@@ -71,6 +86,15 @@ namespace RobotMarket.RemoteControl.Unity
         public bool logMessages = false;
 
         public RobotSession Session { get; private set; }
+
+        /// <summary>Project name actually reported (Inspector value, else the project folder / product name).</summary>
+        public string ProjectName => !string.IsNullOrWhiteSpace(projectName) ? projectName.Trim()
+            : Application.isEditor ? System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(Application.dataPath))
+            : Application.productName;
+
+        /// <summary>Stage name actually reported (Inspector value, else this robot's scene).</summary>
+        public string StageName => !string.IsNullOrWhiteSpace(stageName) ? stageName.Trim()
+            : !string.IsNullOrEmpty(gameObject.scene.name) ? gameObject.scene.name : RobotSession.DefaultName;
 
         readonly Queue<string> _recent = new Queue<string>();
         string _endpoint = "";
@@ -126,10 +150,17 @@ namespace RobotMarket.RemoteControl.Unity
                 driver.Trace = new System.IO.StreamWriter("Logs/rc_tracking.csv", false) { AutoFlush = false };
                 Debug.Log("[RemoteControl] recording joint tracking to Logs/rc_tracking.csv", this);
             }
-            Session = new RobotSession(transport, driver, robotId, displayName, decelTime);
+            Session = new RobotSession(transport, driver, RobotId, DisplayName, decelTime)
+            {
+                Project = ProjectName,
+                Stage = StageName,
+            };
+            var root = articulationRoot;
+            Session.Describer = tree => ArticulationDescriber.Describe(root, driver, tree, gameObject);
             Session.MessageTraced += Trace;
+            Session.ConnectionChanged += OnConnectionChanged;
             Session.Start();
-            Debug.Log($"[RemoteControl] '{robotId}' with {driver.Joints.Count} joints " +
+            Debug.Log($"[RemoteControl] '{RobotId}' in {Session.Project} / {Session.Stage} with {driver.Joints.Count} joints " +
                       $"({string.Join(", ", driver.Joints.Select(j => j.Name))}) → {_endpoint}", this);
         }
 
@@ -205,8 +236,35 @@ namespace RobotMarket.RemoteControl.Unity
         void FixedUpdate()
         {
             if (Session == null) return;
-            Session.Update(Time.fixedDeltaTime, Time.realtimeSinceStartupAsDouble);
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (_lastStep > 0 && now - _lastStep > 1.0) ReportHitch(now - _lastStep, now);
+            _lastStep = now;
+            Session.Update(Time.fixedDeltaTime, now);
             _driver?.EndStep();
+        }
+
+        double _lastStep, _lastHitchLog = double.NegativeInfinity, _worstHitch;
+        int _hitches;
+
+        /// <summary>Unity went a while without a physics step (slow render / Editor frame). The session keeps the
+        /// link alive from a background thread; motion just takes longer. Logged at most every 30 s.</summary>
+        void ReportHitch(double seconds, double now)
+        {
+            _hitches++;
+            _worstHitch = Math.Max(_worstHitch, seconds);
+            if (now - _lastHitchLog < 30) return;
+            Debug.LogWarning($"[RemoteControl] Unity stalled {_hitches}x, up to {_worstHitch:0.0} s without a physics step " +
+                             "(slow rendering or Editor work - see Window > Analysis > Profiler). Motion slows down during " +
+                             "stalls; the connection is kept alive.", this);
+            _lastHitchLog = now;
+            _hitches = 0;
+            _worstHitch = 0;
+        }
+
+        void OnConnectionChanged(bool connected, string reason)
+        {
+            if (connected) Debug.Log($"[RemoteControl] connected → {_endpoint}", this);
+            else Debug.LogWarning($"[RemoteControl] disconnected: {reason ?? "unknown reason"}", this);
         }
 
         void OnDisable()
@@ -214,6 +272,7 @@ namespace RobotMarket.RemoteControl.Unity
             if (Session == null) return;
             if (_driver?.Trace != null) { _driver.Trace.Flush(); _driver.Trace.Dispose(); _driver.Trace = null; }
             Session.MessageTraced -= Trace;
+            Session.ConnectionChanged -= OnConnectionChanged;
             Session.Shutdown();
             Session = null;
         }
@@ -258,11 +317,12 @@ namespace RobotMarket.RemoteControl.Unity
             var lines = new List<string>();
             if (!overlayExpanded)
             {
-                lines.Add($"[+] {displayName}   {CommName(Session.Transport)}   {StatusText()}   {ex.State}");
+                lines.Add($"[+] {DisplayName}   {CommName(Session.Transport)}   {StatusText()}   {ex.State}");
             }
             else
             {
-                lines.Add($"[-] {displayName} ({robotId})");
+                lines.Add($"[-] {DisplayName} ({RobotId})");
+                lines.Add($"data: {Session.Project} / {Session.Stage} / {RobotId}");
                 lines.Add($"comm: {CommName(Session.Transport)}   {_endpoint}");
                 lines.Add(StatusText());
                 lines.Add($"state: {ex.State}" + (ex.ActiveGoalId != null ? $"  goal {ex.ActiveGoalId}" : "")

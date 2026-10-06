@@ -24,6 +24,7 @@ class MsgType:
     RESULT = "result"
     STATE = "state"
     ACK = "ack"
+    DESCRIPTION = "description"
     # controller → robot
     WELCOME = "welcome"
     EXECUTE = "execute"
@@ -31,6 +32,7 @@ class MsgType:
     RESUME = "resume"
     CANCEL = "cancel"
     STOP = "stop"
+    DESCRIBE = "describe"
     # both
     HEARTBEAT = "heartbeat"
 
@@ -40,7 +42,7 @@ CONTROL_TYPES = frozenset({MsgType.PAUSE, MsgType.RESUME, MsgType.CANCEL, MsgTyp
 
 class Channel(Enum):
     COMMAND = "command"  # goals — may be large
-    CONTROL = "control"  # pause/resume/cancel/stop/heartbeat/welcome — must never wait behind goals
+    CONTROL = "control"  # pause/resume/cancel/stop/describe/heartbeat/welcome — never waits behind goals
     STATUS = "status"    # everything the robot sends
 
 
@@ -51,6 +53,7 @@ _CHANNEL_OF = {
     MsgType.CANCEL: Channel.CONTROL,
     MsgType.STOP: Channel.CONTROL,
     MsgType.WELCOME: Channel.CONTROL,
+    MsgType.DESCRIBE: Channel.CONTROL,
 }
 
 

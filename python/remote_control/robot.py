@@ -8,9 +8,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .executor import JointDriver, MotionExecutor
+from .kinematics import FRAME, IDENTITY_POSE, forward_kinematics
 from .protocol import (PROTOCOL_VERSION, Envelope, MsgType, Sequencer, SeqTracker, channel_of)
 from .connectors.base import RobotConnector
 
@@ -18,14 +19,29 @@ log = logging.getLogger(__name__)
 
 
 class RobotRuntime:
+    """
+    project / stage: names the robot reports (in `hello` and `description`); the controller files this robot's
+    data under <data_dir>/<project>/<stage>/<robot_id>. tree: kinematic tree (kinematics.load_urdf_tree) for
+    `describe` replies; base_pose: where the tree's root link is in the world. describer(tree) can replace the
+    built-in description entirely (simulators with their own scene graph).
+    """
+
     def __init__(self, connector: RobotConnector, driver: JointDriver, robot_id: str,
                  name: str = "", tick_hz: float = 100.0, decel_time: float = 0.4,
-                 software: str = "remote-control-py/0.1") -> None:
+                 software: str = "remote-control-py/0.1", project: str = "", stage: str = "",
+                 tree: Optional[Mapping[str, Any]] = None,
+                 base_pose: Optional[Mapping[str, Any]] = None,
+                 describer: Optional[Callable[[bool], Dict[str, Any]]] = None) -> None:
         self.connector = connector
         self.driver = driver
         self.robot_id = robot_id
         self.name = name or robot_id
         self.software = software
+        self.project = project or "default"
+        self.stage = stage or "default"
+        self.tree = tree
+        self.base_pose = dict(base_pose or IDENTITY_POSE)
+        self.describer = describer
         self.tick_period = 1.0 / tick_hz
         self.executor = MotionExecutor(driver, self._emit, decel_time)
         self.heartbeat_interval = 0.5
@@ -82,9 +98,40 @@ class RobotRuntime:
             "software": self.software,
             "joints": [j.to_dict() for j in self.driver.joints()],
             "supports": {"pause": True, "report_points": True, "report_progress": True,
-                         "pose_targets": False},
+                         "pose_targets": False, "describe": True},
+            "project": self.project,
+            "stage": self.stage,
             "state": self.executor.state_payload(),
         }
+
+    def describe(self, tree: bool = True) -> Dict[str, Any]:
+        """Body of a `description` reply (without ref_seq / ok / message)."""
+        pos = self.driver.read_positions()
+        joints = self.driver.joints()
+        d: Dict[str, Any] = {
+            "project": self.project, "stage": self.stage, "robot": self.robot_id, "name": self.name,
+            "software": self.software, "frame": FRAME, "base_pose": self.base_pose,
+            "positions": {j.name: pos.get(j.name) for j in joints},
+            "state": self.executor.state,
+        }
+        if self.describer is not None:
+            d.update(self.describer(tree))
+            return d
+        if not tree:
+            return d
+        if self.tree is not None:
+            poses = forward_kinematics(self.tree, pos, self.base_pose)
+            d["root"] = self.tree.get("root")
+            d["links"] = [{"name": l["name"], "pose": poses.get(l["name"])} for l in self.tree["links"]]
+            d["joints"] = [dict(j, position=pos.get(j["command_name"]) if j.get("command_name") else None)
+                           for j in self.tree["joints"]]
+        else:   # joints only: no geometry known
+            d["root"] = None
+            d["links"] = []
+            d["joints"] = [{"name": j.name, "type": j.type, "parent": None, "child": None, "command_name": j.name,
+                            "lower": j.lower, "upper": j.upper, "max_velocity": j.max_velocity,
+                            "position": pos.get(j.name)} for j in joints]
+        return d
 
     # ── connector events ─────────────────────────────────────────────────────
 
@@ -118,6 +165,13 @@ class RobotRuntime:
             p = env.payload
             self.heartbeat_interval = float(p.get("heartbeat_interval", self.heartbeat_interval))
             self.heartbeat_timeout = float(p.get("heartbeat_timeout", self.heartbeat_timeout))
+        elif env.type == MsgType.DESCRIBE:
+            try:
+                body = {"ok": True, "message": "", **self.describe(bool(env.payload.get("tree", True)))}
+            except Exception as exc:  # report, don't drop the connection
+                log.exception("describe failed")
+                body = {"ok": False, "message": f"describe failed: {exc}"}
+            self._emit(MsgType.DESCRIPTION, None, {"ref_seq": env.seq, **body})
         elif env.type != MsgType.HEARTBEAT:
             self.executor.handle(env)
         await self._flush()

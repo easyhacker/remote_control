@@ -38,7 +38,7 @@ Transports keep three logical channels so that a `pause` is never queued behind 
 | Channel | Types |
 |---|---|
 | `command` | `execute` |
-| `control` | `pause`, `resume`, `cancel`, `stop`, `heartbeat`, `welcome` |
+| `control` | `pause`, `resume`, `cancel`, `stop`, `describe`, `heartbeat`, `welcome` |
 | `status` | everything sent by the robot |
 
 ## Units
@@ -52,10 +52,13 @@ Sent right after connecting. It is sent again every `max(1 s, heartbeat_timeout)
 ```json
 { "protocol": 1, "name": "Demo arm", "software": "remote-control-unity/0.1",
   "joints": [ { "name": "shoulder", "type": "revolute", "lower": -3.14, "upper": 3.14, "max_velocity": 2.0 } ],
-  "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false },
+  "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false, "describe": true },
+  "project": "My project", "stage": "robot0625",
   "state": { "...": "same as the state message" } }
 ```
 `lower` / `upper` / `max_velocity` may be `null` (unlimited).
+`project` and `stage` name where the robot lives (Unity: the project folder and the scene). Together with the
+`robot_id` they identify the robot's data on the controller (see [Robot data](#robot-data)). Both default to `"default"`.
 
 ### `accepted` / `rejected`
 The reply to every `execute`, sent before any motion starts.
@@ -103,6 +106,33 @@ The reply to `pause` / `resume` / `cancel` / `stop`.
 { "ref_seq": 17, "ref_type": "pause", "ok": false, "message": "no such goal" }
 ```
 
+### `description`
+The reply to `describe`. `ref_seq` is the `seq` of the request.
+```json
+{ "ref_seq": 21, "ok": true, "message": "",
+  "project": "My project", "stage": "robot0625", "robot": "unity-arm", "name": "Unity arm", "model": "robot_0625_ros2",
+  "frame": "ros: x forward, y left, z up; metres; orientation quaternion [x, y, z, w]",
+  "base_pose": { "position": [0.0, 0.0, 0.215], "orientation": [0.0, 0.0, 0.0, 1.0] },
+  "positions": { "R_shoulder": 0.0, "R_arm1": 0.63 },
+  "state": "idle",
+  "root": "base",
+  "links": [ { "name": "base", "pose": { "position": [0, 0, 0.215], "orientation": [0, 0, 0, 1] } } ],
+  "joints": [ { "name": "R_arm1_joint", "type": "revolute", "parent": "R_shoulder", "child": "R_arm1",
+                "origin": { "xyz": [0.0466, -0.0064, 0.0365], "rpy": [0.0, 0.0, 0.0] }, "axis": [0, 0, -1],
+                "lower": -0.52, "upper": 1.75, "max_velocity": 2.0,
+                "command_name": "R_arm1", "position": 0.63 } ] }
+```
+- All poses use the ROS / URDF convention named in `frame`: x forward, y left, z up, metres, quaternions `[x, y, z, w]`.
+- `base_pose` is where the robot's root link is in the world (the scene): the robot's location.
+- `root`, `links` and `joints` (the kinematic tree) are present only when the request asked for `tree: true`.
+  `links[].pose` is each link's current world pose.
+- `joints[]` follow URDF: `origin` is the child frame relative to the parent at position 0, and `axis` is in the child (joint)
+  frame. `type` is `revolute`, `continuous`, `prismatic`, `fixed` or `spherical`.
+  `command_name` is the name `execute` and `positions` use; it is `null` for joints that cannot be commanded.
+  `position` is the current value (rad / m).
+- A robot that knows no geometry sends `joints` with `parent` / `child` / `origin` left out or `null`.
+- On failure: `{ "ref_seq": 21, "ok": false, "message": "..." }`.
+
 ### `heartbeat`
 An empty payload. See [Heartbeats](#heartbeats).
 
@@ -146,8 +176,30 @@ then ends `canceled`, and the next queued goal starts.
 ### `stop`
 No `goal_id`. The active goal slows to a halt and ends `stopped`. Every queued goal ends `stopped`. The robot holds position.
 
+### `describe`
+Asks for a `description`. Sent on the control channel; it never interrupts motion.
+```json
+{ "tree": true }
+```
+`tree: false` asks only for names, `base_pose` and `positions` (cheap: the controller uses it to read current positions,
+for example when saving a pose). Robots that support it set `supports.describe` in `hello`.
+
 ### `heartbeat`
 An empty payload.
+
+## Robot data
+
+The protocol only carries `describe` / `description`. The reference controller (`python/remote_control`) also keeps files
+per robot, under the `data_dir` of the system config:
+
+```
+<data_dir>/<project>/<stage>/<robot_id>/
+    description.json    the last description (tree: true), with saved_at
+    poses.json          named joint poses: { "poses": { "<name>": { "positions": { "<joint>": value }, "saved_at": "..." } } }
+```
+
+Names come from the robot's `hello` / `description`. Characters not allowed in file names (`<>:"/\|?*`) become `_`.
+Moving to a saved pose is an ordinary one-point `execute`.
 
 ## Goal lifecycle
 

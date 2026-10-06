@@ -5,11 +5,17 @@ Interactive controller: waits for a robot, then lets you send goals and interrup
     python examples/controller_demo.py --url ws://0.0.0.0:9000/motion      # explicit override, ignores the file
     python examples/controller_demo.py --script              # run a scripted demo and exit (CI / smoke test)
 
-Keys (type + Enter):
+Commands (type + Enter):
     g  go: send the demo sequence (all joints, timed poses)
     h  home: all joints to 0
     p  pause      r  resume      c  cancel the current goal      s  stop everything
     i  robot info / state        q  quit
+    d              describe: names (project / stage / robot), base location and kinematic tree,
+                   saved to <data_dir>/<project>/<stage>/<robot>/description.json
+    save NAME      save the current joint positions as pose NAME
+    go NAME        move to saved pose NAME
+    poses          list saved poses
+    del NAME       delete saved pose NAME
 """
 import argparse
 import asyncio
@@ -23,9 +29,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 if hasattr(sys.stdout, "reconfigure"):  # Windows consoles default to cp1252
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from remote_control import (ConfigError, GoalRejected, MotionController,  # noqa: E402
-                            controller_connector_from_config, controller_connector_from_url,
-                            load_system_config, system_config_path)
+from remote_control import (ConfigError, GoalRejected, MotionController, PoseNotFound,  # noqa: E402
+                            RobotError, controller_connector_from_config, controller_connector_from_url,
+                            data_dir_from_config, load_system_config, system_config_path)
+
+HELP = ("commands: g go · h home · p pause · r resume · c cancel · s stop · i info · q quit\n"
+        "          d describe · save NAME · go NAME · poses · del NAME")
 
 
 def describe(section):
@@ -82,6 +91,25 @@ def home_points(robot):
     return robot.joint_names, _timed(robot, [[clamp(j, 0.0) for j in robot.joints]], min_segment=2.0)
 
 
+def fmt_pose(pose):
+    p, q = pose["position"], pose["orientation"]
+    return (f"xyz=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}) m  "
+            f"quat=({q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f})")
+
+
+async def describe_and_save(robot):
+    path, d = await robot.save_description()
+    print(f"  project: {d['project']}")
+    print(f"  stage:   {d['stage']}")
+    print(f"  robot:   {d['robot']}" + (f"  (model {d['model']})" if d.get("model") else ""))
+    print(f"  base:    {fmt_pose(d['base_pose'])}  [{d.get('frame', '')}]")
+    joints = d.get("joints", [])
+    moving = [j for j in joints if j.get("command_name")]
+    print(f"  tree:    root {d.get('root')}, {len(d.get('links', []))} links, {len(joints)} joints "
+          f"({len(moving)} movable)")
+    print(f"  saved:   {path}")
+
+
 def print_event(ev):
     kind = ev["event"]
     if kind == "feedback":
@@ -99,14 +127,18 @@ async def interactive(controller):
 
     def read_stdin():
         for line in sys.stdin:
-            loop.call_soon_threadsafe(keys.put_nowait, line.strip().lower())
+            loop.call_soon_threadsafe(keys.put_nowait, line.strip())
         loop.call_soon_threadsafe(keys.put_nowait, "q")
 
     threading.Thread(target=read_stdin, daemon=True).start()
     goal = None
-    print("keys: g go · h home · p pause · r resume · c cancel · s stop · i info · q quit")
+    print(HELP)
     while True:
-        key = await keys.get()
+        line = await keys.get()
+        key, _, arg = line.partition(" ")
+        key, arg = key.lower(), arg.strip()
+        if not key:
+            continue
         robot = next((r for r in controller.robots.values() if r.online), None)
         if key == "q":
             return
@@ -114,7 +146,25 @@ async def interactive(controller):
             print("no robot online yet")
             continue
         try:
-            if key in ("g", "h"):
+            if key in ("save", "go", "del", "delete") and not arg:
+                print(f"  usage: {key} NAME")
+            elif key in ("d", "describe"):
+                await describe_and_save(robot)
+            elif key == "save":
+                path = await robot.save_pose(arg)
+                print(f"  saved pose '{arg}' ({len(robot.joint_names)} joints) → {path}")
+            elif key == "go":
+                goal = await robot.move_to_pose(arg, report="points")
+                goal.on("*", print_event)
+                print(f"→ moving to pose '{arg}': goal {goal.goal_id} accepted (queue position {goal.queue_position})")
+            elif key in ("poses", "list"):
+                names = robot.list_poses()
+                where = "/".join(robot.names.values())
+                print(f"  poses of {where}: " + (", ".join(names) if names else "(none)"))
+            elif key in ("del", "delete"):
+                robot.delete_pose(arg)
+                print(f"  deleted pose '{arg}'")
+            elif key in ("g", "h"):
                 names, pts = demo_points(robot) if key == "g" else home_points(robot)
                 goal = await robot.execute(names, pts, report="points")
                 goal.on("*", print_event)
@@ -128,12 +178,17 @@ async def interactive(controller):
             elif key == "s":
                 print("  ack", await robot.stop())
             elif key == "i":
-                print(f"  {robot.name} ({robot.robot_id}) joints={robot.joint_names}")
+                print(f"  {robot.name} ({robot.robot_id}) in {robot.project} / {robot.stage}")
+                print(f"  joints={robot.joint_names}")
                 print(f"  state={robot.state}")
+            else:
+                print(f"  unknown command '{line}'\n{HELP}")
         except GoalRejected as exc:
             print(f"  rejected: {exc.reason}")
+        except (PoseNotFound, RobotError, ConfigError) as exc:
+            print(f"  {exc.args[0] if exc.args else exc}")
         except Exception as exc:  # keep the prompt alive
-            print(f"  error: {exc}")
+            print(f"  error: {exc or type(exc).__name__}")
 
 
 async def scripted(robot):
@@ -198,6 +253,7 @@ async def main():
     ap.add_argument("--robot", default=None, help="robot_id to wait for (default: first to connect)")
     ap.add_argument("--script", action="store_true", help="run the scripted test and exit")
     ap.add_argument("--timeout", type=float, default=120)
+    ap.add_argument("--data-dir", default=None, help="robot data directory (default: data_dir from the config file)")
     args = ap.parse_args()
 
     config = {}
@@ -212,8 +268,12 @@ async def main():
         print(f"config: {system_config_path()}")
         connector = controller_connector_from_config(config)
     hb = config.get("heartbeat", {})
+    data_dir = args.data_dir
+    if data_dir is None and config.get("data_dir"):
+        data_dir = data_dir_from_config(config, system_config_path())
     controller = MotionController(connector, heartbeat_interval=float(hb.get("interval", 0.5)),
-                                  heartbeat_timeout=float(hb.get("timeout", 2.0)))
+                                  heartbeat_timeout=float(hb.get("timeout", 2.0)), data_dir=data_dir)
+    print(f"data: {data_dir or '(none - set data_dir in the config or pass --data-dir)'}")
     args.url = args.url or describe(config["connector"])
     controller.on("robot_online", lambda e: print(f"● robot online: {e['robot_id']}"))
     controller.on("robot_offline", lambda e: print(f"○ robot offline: {e['robot_id']}"))

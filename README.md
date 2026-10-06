@@ -37,6 +37,8 @@ The connector, the codec and the joint driver are independent plug-ins. The moti
    ```
 3. Press **Play** in Unity. The overlay shows `● connected`, and the controller prints `robot online: unity-arm`.
 4. In the controller window, type `g` + Enter (go), then `p` (pause), `r` (resume), `c` (cancel), `s` (stop), `h` (home).
+5. Robot data: `d` describes the robot (project / stage / robot names, base location, kinematic tree) and saves it;
+   `save NAME`, `go NAME`, `poses` and `del NAME` manage named joint poses. See [Robot data](#robot-data).
 
 For your own robot, add **RemoteControlRobot** to the root `ArticulationBody`. Each revolute or prismatic
 joint is listed under its GameObject name, with limits taken from the drive. Override joint names, limits or max speeds in the inspector.
@@ -96,6 +98,66 @@ goal.on("point_reached", lambda p: print("reached", p["point_index"], p["max_err
 await goal.pause();  await goal.resume()       # or goal.cancel(); robot.stop()
 print(await goal.result())                     # {"status": "succeeded", "positions": [...]}
 ```
+
+## Robot data
+
+The controller keeps files per robot under the config's `data_dir` (`D:\Dev\remote_control\data` here; not in git):
+
+```
+<data_dir>/<project>/<stage>/<robot_id>/description.json   names, base location, kinematic tree, joint positions
+<data_dir>/<project>/<stage>/<robot_id>/poses.json         named joint poses
+```
+
+The robot reports `project` and `stage`. Unity uses the project folder and the scene name; override them under
+**RemoteControlRobot → Data names**. `fake_robot.py` takes `--project` / `--stage`. Description poses use the ROS
+convention (x forward, y left, z up, metres), so a Unity robot's tree can be compared with its URDF.
+
+| `controller_demo.py` command | API |
+|---|---|
+| `d` | `path, desc = await robot.save_description()` (or `await robot.describe()` without saving) |
+| `save NAME` | `await robot.save_pose("NAME")` (current positions of all joints; `joints=[...]` for a subset) |
+| `go NAME` | `goal = await robot.move_to_pose("NAME")` (timed from the joints' max velocities) |
+| `poses` | `robot.list_poses()` |
+| `del NAME` | `robot.delete_pose("NAME")` |
+
+The controller needs the directory: `MotionController(connector, data_dir=data_dir_from_config(config, system_config_path()))`.
+
+## Robotic Toolbox (desktop app)
+
+A wxPython controller with native widgets on Windows, macOS and Linux:
+- **Joint jog:** click a step, or hold to move continuously; drag a slider to go to a value.
+- **Poses:** save, go to and delete, in the same `poses.json` as `controller_demo.py`.
+- **Targets:** the tool pose (x y z, roll pitch yaw) relative to any link above it, with a reachability check and
+  *Move to target*. Inverse kinematics runs in the Toolbox (numpy, damped least squares within the joint limits)
+  on the kinematic tree from `describe`, so it works for any robot that supports describe. It does not check
+  collisions.
+
+```bash
+cd python
+.venv/Scripts/pip install -e .[toolbox]          # websockets, paho-mqtt, wxPython, numpy
+.venv/Scripts/python -m robotic_toolbox          # connector + data folder from %RC_CONFIG_DIR%\remote_control.json
+```
+
+The Toolbox is the controller: start it, then the robot. `--url` and `--data-dir` override the config file.
+`robotic_toolbox/backend.py` (controller thread, jog, poses) and `ik.py` have no GUI imports; `app.py` is the window.
+
+**ROS 2 robots** reach the Toolbox through `examples/ros2_robot_bridge.py` with a WebSocket or MQTT `--url`.
+The bridge runs on the ROS install's Python (3.8 on Windows Humble) and the Toolbox on 3.12:
+
+```
+Robotic Toolbox (3.12) ⇄ WebSocket / MQTT ⇄ ros2_robot_bridge.py (3.8 + rclpy) ⇄ ros2_control robot
+```
+
+### Cythonized build
+
+```bash
+.venv/Scripts/pip install cython setuptools       # plus a C compiler (Visual Studio Build Tools on Windows)
+.venv/Scripts/python tools/build_cython.py --test # → build/cython: compiled remote_control + robotic_toolbox, tests run on it
+cd build/cython && ../../.venv/Scripts/python -m robotic_toolbox
+```
+
+Each module becomes a native extension (`.pyd` / `.so`). Only the `__init__.py` / `__main__.py` files stay Python.
+Build with the same Python version that will run the app.
 
 ## Tests
 
@@ -220,15 +282,18 @@ python/
   remote_control/   protocol.py · trajectory.py · executor.py · robot.py · controller.py
                     connectors/  base · loopback · websocket · mqtt · ros2 · config (file loading)
                     drivers/ros2.py (Ros2JointDriver) · urdf.py (limits from URDF)
+                    kinematics.py (URDF tree, forward kinematics) · data.py (descriptions, saved poses)
+  robotic_toolbox/  app.py (wxPython window) · backend.py (controller thread) · ik.py (inverse kinematics)
   examples/         controller_demo.py (interactive / --script) · fake_robot.py
                     ros2_robot_bridge.py · fake_ros2_control.py · demo_arm.urdf
-  tools/            mini_mqtt_broker.py (tests / demos)
-  tests/            test_motion.py (conformance suite)
+  tools/            mini_mqtt_broker.py (tests / demos) · check_description.py (description vs URDF)
+                    build_cython.py (compiled build)
+  tests/            test_motion.py (conformance suite) · test_toolbox.py (IK, toolbox backend)
 unity/              Unity 6 project
   Packages/com.robotmarket.remote-control/
     Runtime/Core/   no UnityEngine: Protocol · Trajectory · MotionExecutor · Transport (WebSocket) · MqttTransport · RobotSession
     Runtime/Plugins/MQTTnet/   MQTTnet 4.3.7 (netstandard2.1, MIT)
-    Runtime/Unity/  ArticulationJointDriver · RemoteControlRobot (component + overlay)
-    Editor/         DemoArmBuilder (menu + batch scene/player builds)
+    Runtime/Unity/  ArticulationJointDriver · ArticulationDescriber (tree for describe) · RemoteControlRobot (component + overlay)
+    Editor/         DemoArmBuilder (menu + batch scene/player builds) · debug dumps
     Tests~/DotnetRobot/   .NET harness: C# core as a fake robot + self-test
 ```

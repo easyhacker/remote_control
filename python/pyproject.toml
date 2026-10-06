@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "remote-control"
-version = "0.3.0"
+version = "0.4.0"
 description = "Transport-neutral motion protocol: send timed joint goals to robots/simulators, get reports, pause/resume/cancel/stop."
 requires-python = ">=3.8"
 dependencies = []
@@ -13,6 +13,8 @@ dependencies = []
 websocket = ["websockets>=10"]
 mqtt = ["paho-mqtt>=2.0"]
 all = ["websockets>=10", "paho-mqtt>=2.0"]
+toolbox = ["websockets>=10", "paho-mqtt>=2.0", "wxPython>=4.2", "numpy>=1.24"]
+build = ["Cython>=3.0", "setuptools>=61"]
 
 [tool.setuptools.packages.find]
-include = ["remote_control*"]
+include = ["remote_control*", "robotic_toolbox*"]

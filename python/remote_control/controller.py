@@ -10,18 +10,28 @@ Controller-side API: the code that decides what robots do uses only this module.
     goal.on("point_reached", lambda p: print(p))
     await goal.pause(); await goal.resume()
     print(await goal.result())
+
+Robot data (needs MotionController(..., data_dir=...)), filed under <data_dir>/<project>/<stage>/<robot_id>:
+
+    path, desc = await robot.save_description()      # names, base location, kinematic tree, positions
+    await robot.save_pose("ready")                    # current joint positions
+    goal = await robot.move_to_pose("ready")          # timed from the joints' max_velocity
+    robot.list_poses(); robot.delete_pose("ready")
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .protocol import (CONTROL_TYPES, Envelope, GoalStatus, MsgType, Sequencer, SeqTracker,
                        channel_of, new_goal_id)
 from .trajectory import Joint
 from .connectors.base import ControllerConnector, Link
+from .connectors.config import ConfigError
+from .data import DEFAULT_NAME, RobotStore
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +47,10 @@ class GoalRejected(Exception):
 
 class RobotOffline(ConnectionError):
     pass
+
+
+class RobotError(RuntimeError):
+    """The robot answered a request with ok=false, or does not support it."""
 
 
 class _Events:
@@ -127,6 +141,8 @@ class RobotHandle(_Events):
         self.joints: List[Joint] = []
         self.supports: Dict[str, Any] = {}
         self.state: Dict[str, Any] = {}
+        self.project = DEFAULT_NAME
+        self.stage = DEFAULT_NAME
         self.online = False
         self._link: Optional[Link] = None
         self._seq: Optional[Sequencer] = None
@@ -168,6 +184,89 @@ class RobotHandle(_Events):
     async def stop(self) -> Dict[str, Any]:
         return await self._control(MsgType.STOP, None)
 
+    # ── description and saved poses ─────────────────────────────────────────
+
+    @property
+    def names(self) -> Dict[str, str]:
+        """project / stage / robot as reported by the robot (robot = robot_id)."""
+        return {"project": self.project, "stage": self.stage, "robot": self.robot_id}
+
+    async def describe(self, tree: bool = True, timeout: float = 5.0) -> Dict[str, Any]:
+        """Ask the robot for its names, base location, joint positions and (tree=True) kinematic tree."""
+        if not self.supports.get("describe"):
+            raise RobotError(f"robot {self.robot_id} does not support describe (older client?)")
+        fut = asyncio.get_event_loop().create_future()
+        env = await self._send(MsgType.DESCRIBE, {"tree": tree})
+        self._acks[env.seq] = fut
+        try:
+            reply = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            raise RobotError(f"no description from robot {self.robot_id} within {timeout:g} s") from None
+        finally:
+            self._acks.pop(env.seq, None)
+        if not reply.get("ok", False):
+            raise RobotError(reply.get("message") or "describe failed")
+        self.project = reply.get("project") or self.project
+        self.stage = reply.get("stage") or self.stage
+        return {k: v for k, v in reply.items() if k not in ("ref_seq", "ok", "message")}
+
+    @property
+    def store(self) -> RobotStore:
+        data_dir = self.controller.data_dir
+        if data_dir is None:
+            raise ConfigError('no data directory - set "data_dir" in remote_control.json')
+        return RobotStore(data_dir, self.project, self.stage, self.robot_id)
+
+    async def save_description(self, timeout: float = 5.0) -> Tuple[Path, Dict[str, Any]]:
+        """describe() and write it to <data_dir>/<project>/<stage>/<robot>/description.json."""
+        desc = await self.describe(tree=True, timeout=timeout)
+        return self.store.save_description(desc), desc
+
+    async def current_positions(self) -> Dict[str, float]:
+        """Measured positions of all joints, fresh from the robot when it supports describe."""
+        if self.supports.get("describe"):
+            pos = (await self.describe(tree=False))["positions"]
+        else:
+            pos = self.state.get("positions") or {}
+        return {k: float(v) for k, v in pos.items() if v is not None}
+
+    async def save_pose(self, name: str, joints: Optional[Sequence[str]] = None) -> Path:
+        """Save the current positions of `joints` (default: all) as pose `name` (replaces an existing one)."""
+        pos = await self.current_positions()
+        names = list(joints) if joints else self.joint_names
+        missing = [n for n in names if n not in pos]
+        if missing:
+            raise RobotError(f"no position for joint(s) {', '.join(missing)}")
+        return self.store.save_pose(name, names, [pos[n] for n in names])
+
+    def list_poses(self) -> List[str]:
+        return self.store.list_poses()
+
+    def get_pose(self, name: str) -> Dict[str, float]:
+        return {k: float(v) for k, v in self.store.get_pose(name)["positions"].items()}
+
+    def delete_pose(self, name: str) -> None:
+        self.store.delete_pose(name)
+
+    async def move_to(self, positions: Mapping[str, float], duration: Optional[float] = None,
+                      min_duration: float = 1.0, **execute_kwargs: Any) -> GoalHandle:
+        """One-point goal to `positions` (joint name -> rad / m). Without `duration` it is timed so that every
+        joint stays within its max_velocity (the robot checks 1.5 x average speed; 10 % margin on top)."""
+        names = list(positions)
+        target = [float(positions[n]) for n in names]
+        if duration is None:
+            now = await self.current_positions()
+            limits = {j.name: j.max_velocity for j in self.joints}
+            duration = min_duration
+            for n, x in zip(names, target):
+                vmax = limits.get(n)
+                if vmax and n in now:
+                    duration = max(duration, 1.5 * abs(x - now[n]) / vmax * 1.1)
+        return await self.execute(names, [(target, round(duration, 3))], **execute_kwargs)
+
+    async def move_to_pose(self, name: str, duration: Optional[float] = None, **execute_kwargs: Any) -> GoalHandle:
+        return await self.move_to(self.get_pose(name), duration, **execute_kwargs)
+
     # ── internals ────────────────────────────────────────────────────────────
 
     async def _send(self, msg_type: str, payload: Dict[str, Any], goal_id: Optional[str] = None) -> Envelope:
@@ -193,6 +292,8 @@ class RobotHandle(_Events):
         self.joints = [Joint.from_dict(j) for j in hello.get("joints", [])]
         self.supports = hello.get("supports", {})
         self.state = hello.get("state", {})
+        self.project = hello.get("project") or DEFAULT_NAME
+        self.stage = hello.get("stage") or DEFAULT_NAME
         was_online, self.online = self.online, True
         if not was_online:
             self._fire("online", {"robot_id": self.robot_id})
@@ -210,7 +311,7 @@ class RobotHandle(_Events):
         self._fire("offline", {"robot_id": self.robot_id})
 
     def _on_message(self, env: Envelope) -> None:
-        if env.type == MsgType.ACK:
+        if env.type in (MsgType.ACK, MsgType.DESCRIPTION):
             fut = self._acks.get(int(env.payload.get("ref_seq", -1)))
             if fut and not fut.done():
                 fut.set_result(env.payload)
@@ -232,12 +333,15 @@ class _LinkInfo:
 
 
 class MotionController(_Events):
-    """events: robot_online, robot_offline (payload: {"robot_id"})."""
+    """events: robot_online, robot_offline (payload: {"robot_id"}).
+
+    data_dir: where robot descriptions and saved poses go (see data.py); None disables those features."""
 
     def __init__(self, connector: ControllerConnector, heartbeat_interval: float = 0.5,
-                 heartbeat_timeout: float = 2.0) -> None:
+                 heartbeat_timeout: float = 2.0, data_dir: Optional[Union[str, Path]] = None) -> None:
         super().__init__()
         self.connector = connector
+        self.data_dir = Path(data_dir) if data_dir is not None else None
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
         self.robots: Dict[str, RobotHandle] = {}

@@ -16,20 +16,26 @@ Run from the python/ folder:   python -m unittest discover -s tests -v
 The C# tests need the .NET SDK; they build unity/Packages/com.robotmarket.remote-control/Tests~/DotnetRobot.
 """
 import asyncio
+import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 
-from remote_control import (FakeDriver, GoalRejected, Joint, MotionController, RobotRuntime,  # noqa: E402
-                            Trajectory)
+from remote_control import (FakeDriver, GoalRejected, Joint, MotionController, PoseNotFound,  # noqa: E402
+                            RobotRuntime, RobotStore, Trajectory, data_dir_from_config, forward_kinematics,
+                            load_urdf_tree, safe_name)
+from remote_control.kinematics import quat_from_rpy, quat_rotate  # noqa: E402
 from remote_control.protocol import SeqTracker  # noqa: E402
 from remote_control.connectors.loopback import (LoopbackControllerConnector,  # noqa: E402
                                                 LoopbackRobotConnector)
@@ -40,8 +46,12 @@ JOINTS = [   # the C# harness (Tests~/DotnetRobot/Program.cs) uses the same join
     Joint("slide", "prismatic", 0.0, 0.5, 1.0),
 ]
 ROBOT_ID = "arm-test"
+PROJECT, STAGE = "Test project", "stage:1"   # reported by every test robot; ':' is not allowed in file names
+DEMO_URDF = os.path.join(HERE, "..", "examples", "demo_arm.urdf")
+# repository root (tools/build_cython.py --test runs these tests from a build folder and sets RC_REPO_ROOT)
+REPO_ROOT = os.environ.get("RC_REPO_ROOT") or os.path.normpath(os.path.join(HERE, "..", ".."))
 DOTNET_PROJECT = os.path.normpath(os.path.join(
-    HERE, "..", "..", "unity", "Packages", "com.robotmarket.remote-control", "Tests~", "DotnetRobot"))
+    REPO_ROOT, "unity", "Packages", "com.robotmarket.remote-control", "Tests~", "DotnetRobot"))
 
 
 class TrajectoryTests(unittest.TestCase):
@@ -99,6 +109,68 @@ class UrdfTests(unittest.TestCase):
                 load_urdf_joints(f.name, ["a", "zz"])
         finally:
             os.unlink(f.name)
+
+
+class KinematicsTests(unittest.TestCase):
+    def assertVec(self, a, b, places=6):
+        for x, y in zip(a, b):
+            self.assertAlmostEqual(x, y, places=places)
+
+    def test_rpy_matches_urdf_convention(self):
+        self.assertVec(quat_rotate(quat_from_rpy(0, 0, math.pi / 2), (1, 0, 0)), (0, 1, 0))
+        self.assertVec(quat_rotate(quat_from_rpy(math.pi / 2, 0, 0), (0, 1, 0)), (0, 0, 1))
+        # fixed axes: roll first, then yaw — x stays x under roll, then yaw turns it to y
+        self.assertVec(quat_rotate(quat_from_rpy(math.pi / 2, 0, math.pi / 2), (1, 0, 0)), (0, 1, 0))
+
+    def test_tree_and_forward_kinematics(self):
+        tree = load_urdf_tree(DEMO_URDF)
+        self.assertEqual(tree["root"], "base_link")
+        self.assertEqual([j["command_name"] for j in tree["joints"]],
+                         ["shoulder_yaw", "shoulder_pitch", "elbow", "wrist", "gripper"])
+        self.assertEqual(tree["joints"][4]["type"], "prismatic")
+        zero = forward_kinematics(tree, {})
+        self.assertVec(zero["finger"]["position"], (0, 0, 1.1))
+        bent = forward_kinematics(tree, {"shoulder_pitch": math.pi / 2, "gripper": 0.02})
+        self.assertVec(bent["forearm"]["position"], (0.5, 0, 0.15))
+        self.assertVec(bent["finger"]["position"], (0.95, 0, 0.13))   # gripper x axis now points down
+        base = {"position": [1, 2, 0], "orientation": list(quat_from_rpy(0, 0, math.pi / 2))}
+        moved = forward_kinematics(tree, {"shoulder_pitch": math.pi / 2}, base)
+        self.assertVec(moved["forearm"]["position"], (1, 2.5, 0.15))
+
+
+class DataStoreTests(unittest.TestCase):
+    def test_safe_names(self):
+        self.assertEqual(safe_name("My project"), "My project")
+        self.assertEqual(safe_name("a/b\\c:d"), "a_b_c_d")
+        self.assertEqual(safe_name(""), "default")
+        self.assertEqual(safe_name(".."), "_")
+        self.assertEqual(safe_name("scene. "), "scene")
+
+    def test_data_dir_relative_to_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config" / "remote_control.json"
+            self.assertEqual(data_dir_from_config({"data_dir": "../data"}, cfg), (Path(tmp) / "data").resolve())
+            self.assertEqual(data_dir_from_config({"data_dir": tmp}), Path(tmp).resolve())
+            with self.assertRaises(ValueError):
+                data_dir_from_config({}, cfg)
+
+    def test_poses_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RobotStore(tmp, "P", "S/1", "r")
+            self.assertEqual(store.dir, Path(tmp) / "P" / "S_1" / "r")
+            self.assertEqual(store.list_poses(), [])
+            store.save_pose("b", ["j1", "j2"], [1, 2])
+            store.save_pose("a", ["j1"], [0.5])
+            self.assertEqual(store.list_poses(), ["a", "b"])
+            self.assertEqual(store.get_pose("b")["positions"], {"j1": 1.0, "j2": 2.0})
+            data = json.loads((store.dir / "poses.json").read_text(encoding="utf-8"))
+            self.assertEqual((data["project"], data["stage"], data["robot"]), ("P", "S/1", "r"))
+            store.delete_pose("b")
+            self.assertEqual(store.list_poses(), ["a"])
+            with self.assertRaises(PoseNotFound):
+                store.get_pose("b")
+            with self.assertRaises(ValueError):
+                store.save_pose(" ", ["j1"], [0])
 
 
 class ConnectorConfigTests(unittest.TestCase):
@@ -168,7 +240,7 @@ class ConnectorConfigTests(unittest.TestCase):
             self.assertEqual(load_config(tp)["connector"]["name"], "t")
         except ImportError:
             pass
-        config_dir = os.path.join(HERE, "..", "..", "config")
+        config_dir = os.path.join(REPO_ROOT, "config")
         for folder in (config_dir, os.path.join(config_dir, "examples")):
             for name in os.listdir(folder):
                 if name.endswith(".json"):
@@ -262,6 +334,47 @@ class _Conformance:
         self.assertEqual(self.robot.joints[0].upper, 3.0)
         self.assertTrue(self.robot.supports["pause"])
         self.assertEqual(self.robot.state["state"], "idle")
+
+    async def test_describe_reports_names_positions_and_joints(self):
+        self.assertEqual(self.robot.names, {"project": PROJECT, "stage": STAGE, "robot": ROBOT_ID})  # from hello
+        self.assertTrue(self.robot.supports.get("describe"))
+        d = await self.robot.describe(tree=False)
+        self.assertEqual((d["project"], d["stage"], d["robot"]), (PROJECT, STAGE, ROBOT_ID))
+        self.assertEqual(sorted(d["positions"]), sorted(self.robot.joint_names))
+        self.assertEqual(len(d["base_pose"]["orientation"]), 4)
+        self.assertNotIn("joints", d)
+        full = await self.robot.describe()
+        self.assertEqual([j["command_name"] for j in full["joints"] if j.get("command_name")],
+                         self.robot.joint_names)
+
+    async def test_description_and_poses_are_saved_per_project_stage_robot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.controller.data_dir = Path(tmp)
+            robot_dir = Path(tmp) / "Test project" / "stage_1" / ROBOT_ID
+            path, desc = await self.robot.save_description()
+            self.assertEqual(path, robot_dir / "description.json")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual((saved["project"], saved["stage"], saved["robot"]), (PROJECT, STAGE, ROBOT_ID))
+
+            goal = await self.robot.execute(["shoulder", "slide"], [([1.0, 0.2], 0.5)])
+            self.assertEqual((await goal.result(timeout=3))["status"], "succeeded")
+            await self.robot.save_pose("ready")
+            goal = await self.robot.move_to({"shoulder": 0.0, "slide": 0.0}, duration=0.5)
+            self.assertEqual((await goal.result(timeout=3))["status"], "succeeded")
+            await self.robot.save_pose("zero", joints=["shoulder"])
+            self.assertEqual(self.robot.list_poses(), ["ready", "zero"])
+            self.assertEqual(self.robot.get_pose("zero"), {"shoulder": 0.0})
+
+            goal = await self.robot.move_to_pose("ready")
+            self.assertEqual((await goal.result(timeout=5))["status"], "succeeded")
+            pos = await self.robot.current_positions()
+            self.assertAlmostEqual(pos["shoulder"], 1.0, places=3)
+            self.assertAlmostEqual(pos["slide"], 0.2, places=3)
+
+            self.robot.delete_pose("ready")
+            self.assertEqual(self.robot.list_poses(), ["zero"])
+            with self.assertRaises(PoseNotFound):
+                await self.robot.move_to_pose("ready")
 
     async def test_execute_reports_each_point_and_succeeds(self):
         goal = await self.robot.execute(["shoulder", "elbow"],
@@ -385,7 +498,8 @@ class _Conformance:
 class _PythonRobot:
     def __init__(self, connector):
         self.connector = connector
-        self.runtime = RobotRuntime(connector, FakeDriver(JOINTS), ROBOT_ID, tick_hz=200, decel_time=0.1)
+        self.runtime = RobotRuntime(connector, FakeDriver(JOINTS), ROBOT_ID, tick_hz=200, decel_time=0.1,
+                                    project=PROJECT, stage=STAGE)
 
     async def start(self):
         await self.runtime.start()
@@ -445,8 +559,13 @@ class _DotnetRobot:
         return cls.dll
 
     def __init__(self, url):
-        self.proc = subprocess.Popen(["dotnet", self.build(), url, ROBOT_ID], stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen(["dotnet", self.build(), url, ROBOT_ID, PROJECT, STAGE], stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+    def stall(self, seconds):
+        """Block the harness's update loop (like a slow frame in Unity)."""
+        self.proc.stdin.write(f"stall {seconds}\n".encode())
+        self.proc.stdin.flush()
 
     async def stop(self):
         self.proc.stdin.close()   # harness exits when stdin closes
@@ -458,7 +577,21 @@ class _DotnetRobot:
 
 @unittest.skipUnless(HAVE_WS and shutil.which("dotnet") and os.path.isdir(DOTNET_PROJECT),
                      "needs websockets and the .NET SDK")
-class CSharpRobotTests(_WebSocketController, _Conformance, unittest.IsolatedAsyncioTestCase):
+class _StallTests:
+    """C# robot only: a blocked update loop (slow render frame) must not drop the link."""
+
+    async def test_slow_update_loop_keeps_link(self):
+        goal = await self.robot.execute(["shoulder"], [([1.0], 0.5)])
+        dropped = []
+        self.robot.on("offline", lambda e: dropped.append(e))
+        self.robot_side.stall(3 * self.controller.heartbeat_timeout)   # well past the timeout
+        await asyncio.sleep(3 * self.controller.heartbeat_timeout + 0.5)
+        self.assertEqual(dropped, [], "controller dropped a robot whose update loop was only slow")
+        self.assertTrue(self.robot.online)
+        self.assertEqual((await goal.result(timeout=5))["status"], "succeeded")
+
+
+class CSharpRobotTests(_StallTests, _WebSocketController, _Conformance, unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         _DotnetRobot.build()   # once, outside the event loop
@@ -529,7 +662,7 @@ class MqttFromConfigTests(MqttConnectorTests):
 
 @unittest.skipUnless(HAVE_MQTT and shutil.which("dotnet") and os.path.isdir(DOTNET_PROJECT),
                      "needs paho-mqtt and the .NET SDK")
-class CSharpMqttRobotTests(_MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
+class CSharpMqttRobotTests(_StallTests, _MqttBroker, _Conformance, unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         _DotnetRobot.build()

@@ -140,18 +140,31 @@ namespace RobotMarket.RemoteControl
 
                     using (var linkCts = CancellationTokenSource.CreateLinkedTokenSource(token))
                     {
+                        // Either loop failing ends the connection: a send loop that died unnoticed would leave a
+                        // half-open link (messages still arrive, nothing goes out) until the controller times out.
                         var sendTask = SendLoopAsync(ws, linkCts.Token);
-                        try { await ReceiveLoopAsync(ws, linkCts.Token).ConfigureAwait(false); }
-                        finally
+                        var receiveTask = ReceiveLoopAsync(ws, linkCts.Token);
+                        var first = await Task.WhenAny(sendTask, receiveTask).ConfigureAwait(false);
+                        linkCts.Cancel();
+                        try { ws.Abort(); } catch { /* already closed */ }
+                        try { await Task.WhenAll(sendTask, receiveTask).ConfigureAwait(false); } catch { /* reported below */ }
+                        if (token.IsCancellationRequested)
                         {
-                            linkCts.Cancel();
-                            try { await sendTask.ConfigureAwait(false); } catch { /* cancelled */ }
+                            reason = "stopped";
+                        }
+                        else if (first.IsFaulted)
+                        {
+                            var e = first.Exception?.GetBaseException();
+                            reason = (first == sendTask ? "send failed: " : "receive failed: ") + (e?.Message ?? "unknown error");
+                        }
+                        else
+                        {
+                            reason = "closed by controller";
                         }
                     }
-                    reason = "closed by controller";
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { reason = "stopped"; }
-                catch (Exception e) { reason = e.Message; }
+                catch (Exception e) { reason = reason ?? e.Message; }
                 finally
                 {
                     bool wasConnected = _connected;

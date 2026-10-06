@@ -1,4 +1,4 @@
-// dotnet run -- ws://127.0.0.1:8765/motion [robot_id]   → fake robot with the test joints (also mqtt://host:port/prefix)
+// dotnet run -- ws://127.0.0.1:8765/motion [robot_id [project stage]]   → fake robot with the test joints (also mqtt://host:port/prefix)
 // dotnet run -- --selftest                               → trajectory / parser checks
 using System;
 using System.Diagnostics;
@@ -25,19 +25,30 @@ static class Program
         var transport = TransportFactory.FromUrl(url);
         if (transport is WebSocketRobotTransport ws) ws.MinBackoff = 0.1;
         var session = new RobotSession(transport, driver, robotId, "dotnet fake robot", decelTime: 0.1);
+        if (args.Length > 3) { session.Project = args[2]; session.Stage = args[3]; }
         session.Start();
         Console.WriteLine($"fake robot '{robotId}' → {url}");
 
-        // Exit when the parent closes our stdin (or on Ctrl+C)
+        // Exit when the parent closes our stdin (or on Ctrl+C). "stall <seconds>" blocks the update loop, like a
+        // slow frame in Unity (tests that heartbeats survive it).
         var quit = new ManualResetEventSlim(false);
+        double stallSeconds = 0;
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; quit.Set(); };
-        new Thread(() => { while (Console.In.ReadLine() != null) { } quit.Set(); }) { IsBackground = true }.Start();
+        new Thread(() =>
+        {
+            string line;
+            while ((line = Console.In.ReadLine()) != null)
+                if (line.StartsWith("stall ")) Volatile.Write(ref stallSeconds, double.Parse(line.Substring(6), System.Globalization.CultureInfo.InvariantCulture));
+            quit.Set();
+        }) { IsBackground = true }.Start();
 
         var sw = Stopwatch.StartNew();
         double last = 0;
         while (!quit.IsSet)
         {
             Thread.Sleep(5);
+            double stall = Interlocked.Exchange(ref stallSeconds, 0);
+            if (stall > 0) Thread.Sleep(TimeSpan.FromSeconds(stall));
             double now = sw.Elapsed.TotalSeconds;
             session.Update(now - last);
             last = now;

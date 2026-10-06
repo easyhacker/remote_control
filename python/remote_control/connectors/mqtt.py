@@ -209,7 +209,9 @@ class MqttRobotConnector(RobotConnector):
         _check_level(self.robot_id, "robot_id")
         self._presence = f"{self.url.prefix}/{CONTROLLER_PRESENCE}/online"
         self._inbound = {self._topic("cmd"), self._topic("ctrl")}
-        self._client = _Client(self.url, self.url.client_id or f"rc-robot-{self.robot_id}", self._topic("online"),
+        # random suffix: two robots that (briefly) share a robot_id must not kick each other off the broker
+        client_id = self.url.client_id or f"rc-robot-{self.robot_id}-{uuid.uuid4().hex[:6]}"
+        self._client = _Client(self.url, client_id, self._topic("online"),
                                [self._topic("cmd"), self._topic("ctrl"), self._presence], self._on_event)
         self._client.start()
 

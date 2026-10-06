@@ -131,7 +131,8 @@ class GoalHandle(_Events):
 
 
 class RobotHandle(_Events):
-    """events: online, offline, state, and '*' for all."""
+    """events: online, offline, state, selected (the user picked a visualized item), edited (the user moved an
+    editable item: {"id", "parent", "pose"}), and '*' for all."""
 
     def __init__(self, controller: "MotionController", robot_id: str) -> None:
         super().__init__()
@@ -143,6 +144,7 @@ class RobotHandle(_Events):
         self.state: Dict[str, Any] = {}
         self.project = DEFAULT_NAME
         self.stage = DEFAULT_NAME
+        self.instance: Optional[str] = None
         self.online = False
         self._link: Optional[Link] = None
         self._seq: Optional[Sequencer] = None
@@ -183,6 +185,28 @@ class RobotHandle(_Events):
 
     async def stop(self) -> Dict[str, Any]:
         return await self._control(MsgType.STOP, None)
+
+    async def visualize(self, items: Sequence[Mapping[str, Any]], replace: bool = True) -> Dict[str, Any]:
+        """Show markers (frames, chains) in the robot's viewer; see PROTOCOL.md `visualize`. replace=True
+        removes everything shown before; otherwise items with the same id are updated, and an item
+        {"id": ..., "remove": true} removes one."""
+        if not self.supports.get("visualize"):
+            raise RobotError(f"robot {self.robot_id} has no viewer (supports.visualize is false)")
+        ack = await self._control(MsgType.VISUALIZE, None, payload={"items": [dict(i) for i in items],
+                                                                     "replace": replace})
+        if not ack.get("ok", False):
+            raise RobotError(ack.get("message") or "visualize failed")
+        return ack
+
+    async def target(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        """Create / update / delete / select a target owned by the robot's scene (supports.targets), see
+        PROTOCOL.md `target`. Raises RobotError if the robot refuses."""
+        if not self.supports.get("targets"):
+            raise RobotError(f"robot {self.robot_id} has no scene targets (supports.targets is false)")
+        ack = await self._control(MsgType.TARGET, None, payload=dict(request))
+        if not ack.get("ok", False):
+            raise RobotError(ack.get("message") or "target request failed")
+        return ack
 
     # ── description and saved poses ─────────────────────────────────────────
 
@@ -276,10 +300,11 @@ class RobotHandle(_Events):
         await self._link.send(env, channel_of(msg_type, from_robot=False))
         return env
 
-    async def _control(self, msg_type: str, goal_id: Optional[str], timeout: float = 5.0) -> Dict[str, Any]:
+    async def _control(self, msg_type: str, goal_id: Optional[str], timeout: float = 5.0,
+                       payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         assert msg_type in CONTROL_TYPES
         fut = asyncio.get_event_loop().create_future()
-        env = await self._send(msg_type, {}, goal_id)
+        env = await self._send(msg_type, payload or {}, goal_id)
         self._acks[env.seq] = fut
         try:
             return await asyncio.wait_for(fut, timeout)
@@ -294,6 +319,7 @@ class RobotHandle(_Events):
         self.state = hello.get("state", {})
         self.project = hello.get("project") or DEFAULT_NAME
         self.stage = hello.get("stage") or DEFAULT_NAME
+        self.instance = hello.get("instance")
         was_online, self.online = self.online, True
         if not was_online:
             self._fire("online", {"robot_id": self.robot_id})
@@ -318,6 +344,10 @@ class RobotHandle(_Events):
         elif env.type == MsgType.STATE:
             self.state = env.payload
             self._fire("state", env.payload)
+        elif env.type == MsgType.SELECTED:
+            self._fire("selected", env.payload)
+        elif env.type == MsgType.EDITED:
+            self._fire("edited", env.payload)
         elif env.goal_id and env.type in (MsgType.ACCEPTED, MsgType.REJECTED, MsgType.POINT_REACHED,
                                           MsgType.FEEDBACK, MsgType.RESULT):
             self.goal(env.goal_id)._on(env)
@@ -333,7 +363,8 @@ class _LinkInfo:
 
 
 class MotionController(_Events):
-    """events: robot_online, robot_offline (payload: {"robot_id"}).
+    """events: robot_online, robot_offline (payload: {"robot_id"}), robot_renamed ({"robot_id", "new_id"}:
+    a second robot announced an id already online and was asked to use new_id).
 
     data_dir: where robot descriptions and saved poses go (see data.py); None disables those features."""
 
@@ -407,6 +438,19 @@ class MotionController(_Events):
             info.rx.accept(env.seq)
             info.seq.reset()
             robot = self.robots.get(env.robot_id)
+            instance = env.payload.get("instance")
+            if (robot is not None and robot.online and robot._link is not link and instance and robot.instance
+                    and instance != robot.instance and self._link_alive(robot._link)):
+                # a different robot announced an id that is in use: give it a free one
+                new_id = self._free_id(env.robot_id)
+                log.warning("robot_id '%s' is already online - asking the new robot (instance %s) to use '%s'",
+                            env.robot_id, instance, new_id)
+                welcome = info.seq.stamp(Envelope(MsgType.WELCOME, env.robot_id, {
+                    "heartbeat_interval": self.heartbeat_interval, "heartbeat_timeout": self.heartbeat_timeout,
+                    "robot_id": new_id, "instance": instance}))
+                await link.send(welcome, channel_of(MsgType.WELCOME, from_robot=False))
+                self._fire("robot_renamed", {"robot_id": env.robot_id, "new_id": new_id})
+                return
             if robot is None:
                 robot = self.robots[env.robot_id] = RobotHandle(self, env.robot_id)
             if robot.online and robot._link is not link:
@@ -426,6 +470,16 @@ class MotionController(_Events):
             return
         if env.type != MsgType.HEARTBEAT:
             info.robot._on_message(env)
+
+    def _link_alive(self, link: Optional[Link]) -> bool:
+        info = self._links.get(link.id) if link is not None else None
+        return info is not None and time.monotonic() - info.last_rx <= self.heartbeat_timeout
+
+    def _free_id(self, robot_id: str) -> str:
+        n = 2
+        while f"{robot_id}-{n}" in self.robots and self.robots[f"{robot_id}-{n}"].online:
+            n += 1
+        return f"{robot_id}-{n}"
 
     async def _heartbeat_loop(self) -> None:
         while True:

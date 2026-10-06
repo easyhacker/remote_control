@@ -72,6 +72,7 @@ namespace RobotMarket.RemoteControl
         readonly SemaphoreSlim _wake = new SemaphoreSlim(0);
         readonly object _lock = new object();
         CancellationTokenSource _cts;
+        Task _run;
         IMqttClient _client;
         bool _brokerUp, _controllerUp;
         volatile bool _linked;
@@ -111,7 +112,7 @@ namespace RobotMarket.RemoteControl
             if (_cts != null) return;
             _cts = new CancellationTokenSource();
             var token = _cts.Token;
-            Task.Run(() => RunAsync(token));
+            _run = Task.Run(() => RunAsync(token));
         }
 
         public void Stop()
@@ -130,6 +131,7 @@ namespace RobotMarket.RemoteControl
                 catch { /* broker gone */ }
             }
             cts.Cancel();
+            try { _run?.Wait(2000); } catch { /* cancelled */ }   // the loop is done before a Start() can follow
         }
 
         public void Dispose() => Stop();
@@ -193,7 +195,7 @@ namespace RobotMarket.RemoteControl
 
                 var builder = new MqttClientOptionsBuilder()
                     .WithTcpServer(_host, _port)
-                    .WithClientId(_clientId ?? "rc-robot-" + _robotId)
+                    .WithClientId(_clientId ?? "rc-robot-" + _robotId + "-" + Guid.NewGuid().ToString("N").Substring(0, 6))
                     .WithProtocolVersion(MqttProtocolVersion.V311)
                     .WithCleanSession(true)
                     .WithKeepAlivePeriod(TimeSpan.FromSeconds(_keepAlive))

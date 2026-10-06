@@ -4,6 +4,9 @@ Controller-side data files, one directory per robot:
     <data_dir>/<project>/<stage>/<robot>/
         description.json    last `describe` reply: names, base location, kinematic tree, joint positions
         poses.json          saved joint poses: {"poses": {"<name>": {"positions": {"<joint>": rad|m}, "saved_at"}}}
+        chains.json         named chains: {"chains": {"<name>": {"origin", "end", "tcp": {"xyz", "rpy"}, "saved_at"}}}
+        tcp.json            TCPs of unsaved chains, per end link: {"tcp": {"<link>": {"xyz": [..], "rpy": [..]}}}
+        frames.json         named frames: {"frames": {"<name>": {"parent": "<link>", "xyz": [..], "rpy": [..]}}}
 
 `data_dir` comes from the system config (`"data_dir"` in remote_control.json; a relative path is relative to
 the config file's directory). project / stage / robot are the names the robot reports (Unity: project folder,
@@ -94,6 +97,17 @@ class RobotStore:
     def load_description(self) -> Optional[Dict[str, Any]]:
         path = self.dir / self.DESCRIPTION
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+    # ── any other document (tcp.json, frames.json, …) ───────────────────────
+
+    def load_doc(self, name: str) -> Dict[str, Any]:
+        path = self.dir / name
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+    def save_doc(self, name: str, data: Mapping[str, Any]) -> Path:
+        path = self.dir / name
+        _write_json(path, {"version": 1, **self.names, **data})
+        return path
 
     # ── poses ────────────────────────────────────────────────────────────────
 

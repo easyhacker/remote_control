@@ -73,6 +73,7 @@ namespace RobotMarket.RemoteControl
         readonly ConcurrentQueue<string> _other = new ConcurrentQueue<string>();
         readonly SemaphoreSlim _wake = new SemaphoreSlim(0);
         CancellationTokenSource _cts;
+        Task _run;
         ClientWebSocket _ws;
         volatile bool _connected;
 
@@ -87,9 +88,10 @@ namespace RobotMarket.RemoteControl
             if (_cts != null) return;
             _cts = new CancellationTokenSource();
             var token = _cts.Token;
-            Task.Run(() => RunAsync(token));
+            _run = Task.Run(() => RunAsync(token));
         }
 
+        /// <summary>Close the connection; returns once the background loop has finished (so Start() can follow).</summary>
         public void Stop()
         {
             var cts = _cts;
@@ -97,6 +99,7 @@ namespace RobotMarket.RemoteControl
             if (cts == null) return;
             cts.Cancel();
             try { _ws?.Abort(); } catch { /* already closed */ }
+            try { _run?.Wait(2000); } catch { /* cancelled */ }
         }
 
         public void Dispose() => Stop();

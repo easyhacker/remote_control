@@ -96,12 +96,15 @@ class MiniBroker:
             t.cancel()
 
     async def kick(self, client_id: str) -> bool:
-        """Drop a client's connection as if the network failed (its will is published)."""
-        s = self.sessions.get(client_id)
-        if s is None:
-            return False
-        s.writer.transport.abort()
-        return True
+        """Drop a client's connection as if the network failed (its will is published). A client_id ending
+        in "*" kicks every client whose id starts with the rest (robot client ids carry a random suffix)."""
+        if client_id.endswith("*"):
+            ids = [c for c in self.sessions if c.startswith(client_id[:-1])]
+        else:
+            ids = [client_id] if client_id in self.sessions else []
+        for c in ids:
+            self.sessions[c].writer.transport.abort()
+        return bool(ids)
 
     # ── connection handling ─────────────────────────────────────────────────
 

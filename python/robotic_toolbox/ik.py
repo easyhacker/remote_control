@@ -113,6 +113,7 @@ class IkResult:
     iterations: int
     near_limits: List[str] = field(default_factory=list)
     message: str = ""
+    position_reachable: Optional[bool] = None   # set when a full-pose target failed: could the position alone be reached?
 
 
 class Chain:
@@ -164,7 +165,10 @@ class Chain:
         return out
 
     @classmethod
-    def from_tree(cls, tree: Mapping[str, Any], tool: str, base: Optional[str] = None) -> "Chain":
+    def from_tree(cls, tree: Mapping[str, Any], tool: str, base: Optional[str] = None,
+                  tcp: Optional[np.ndarray] = None) -> "Chain":
+        """Chain from `base` (default: the tree root) to the link `tool`; `tcp` (4x4) is the tool centre point
+        in the tool link's frame, so tool_pose() / solve() work on the TCP instead of the link origin."""
         by_child = {j["child"]: j for j in tree.get("joints", []) if j.get("child")}
         path = cls.ancestors(tree, tool)
         base = base or tree.get("root") or path[-1]
@@ -184,7 +188,33 @@ class Chain:
                 lower=j.get("lower"), upper=j.get("upper")))
             link = j["parent"]
         joints.reverse()
+        if tcp is not None:
+            joints.append(ChainJoint(name="tcp", command_name=None, type="fixed", origin=np.asarray(tcp, dtype=float),
+                                     axis=np.array([1.0, 0, 0]), lower=None, upper=None))
         return cls(joints, base, tool)
+
+    @staticmethod
+    def descendants(tree: Mapping[str, Any], link: str) -> List[str]:
+        """Links below `link` (depth first, in tree order)."""
+        children: Dict[str, List[str]] = {}
+        for j in tree.get("joints", []):
+            if j.get("parent") and j.get("child"):
+                children.setdefault(j["parent"], []).append(j["child"])
+        out: List[str] = []
+        stack = list(reversed(children.get(link, [])))
+        while stack:
+            c = stack.pop()
+            out.append(c)
+            stack.extend(reversed(children.get(c, [])))
+        return out
+
+    @staticmethod
+    def path(tree: Mapping[str, Any], base: str, tool: str) -> List[str]:
+        """Links from base to tool (both included)."""
+        up = Chain.ancestors(tree, tool)
+        if base not in up:
+            raise ValueError(f"'{base}' is not an ancestor of '{tool}'")
+        return list(reversed(up[:up.index(base) + 1]))
 
     # ── kinematics ───────────────────────────────────────────────────────────
 

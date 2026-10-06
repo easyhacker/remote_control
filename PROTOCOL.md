@@ -38,7 +38,7 @@ Transports keep three logical channels so that a `pause` is never queued behind 
 | Channel | Types |
 |---|---|
 | `command` | `execute` |
-| `control` | `pause`, `resume`, `cancel`, `stop`, `describe`, `heartbeat`, `welcome` |
+| `control` | `pause`, `resume`, `cancel`, `stop`, `describe`, `visualize`, `target`, `heartbeat`, `welcome` |
 | `status` | everything sent by the robot |
 
 ## Units
@@ -52,11 +52,15 @@ Sent right after connecting. It is sent again every `max(1 s, heartbeat_timeout)
 ```json
 { "protocol": 1, "name": "Demo arm", "software": "remote-control-unity/0.1",
   "joints": [ { "name": "shoulder", "type": "revolute", "lower": -3.14, "upper": 3.14, "max_velocity": 2.0 } ],
-  "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false, "describe": true },
+  "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false,
+                "describe": true, "visualize": true },
+  "instance": "4f1c0a9e2b7d",
   "project": "My project", "stage": "robot0625",
   "state": { "...": "same as the state message" } }
 ```
 `lower` / `upper` / `max_velocity` may be `null` (unlimited).
+`instance` is random per robot session. It lets the controller tell a reconnect of the same robot (same instance)
+from a different robot that announces an id already in use (see [Robot ids](#robot-ids)).
 `project` and `stage` name where the robot lives (Unity: the project folder and the scene). Together with the
 `robot_id` they identify the robot's data on the controller (see [Robot data](#robot-data)). Both default to `"default"`.
 
@@ -133,6 +137,22 @@ The reply to `describe`. `ref_seq` is the `seq` of the request.
 - A robot that knows no geometry sends `joints` with `parent` / `child` / `origin` left out or `null`.
 - On failure: `{ "ref_seq": 21, "ok": false, "message": "..." }`.
 
+### `selected`
+The user picked a visualized item in the robot's viewer (clicked a frame in Unity's Game view, selected it in the
+Hierarchy). Robots without a viewer never send it.
+```json
+{ "id": "frame:pick", "source": "click" }
+```
+
+### `edited`
+The user moved an `editable` item in the viewer (Unity: Move / Rotate tools in the Scene view). Sent once the item
+stops changing. `pose` is the new pose in the `parent` link (ROS convention); the controller decides what to do
+with it (the Robotic Toolbox saves it as the TCP or frame).
+```json
+{ "id": "tcp:right arm", "parent": "R_claw",
+  "pose": { "position": [0, 0, 0.12], "orientation": [0, 0, 0, 1] }, "source": "editor" }
+```
+
 ### `heartbeat`
 An empty payload. See [Heartbeats](#heartbeats).
 
@@ -143,6 +163,8 @@ The reply to `hello`. Sets the heartbeat timing.
 ```json
 { "heartbeat_interval": 0.5, "heartbeat_timeout": 2.0 }
 ```
+If it also carries `robot_id` (and `instance` equal to the robot's), the id is taken: the robot switches to that id,
+reconnects and sends `hello` under it (see [Robot ids](#robot-ids)).
 
 ### `execute`
 ```json
@@ -184,8 +206,70 @@ Asks for a `description`. Sent on the control channel; it never interrupts motio
 `tree: false` asks only for names, `base_pose` and `positions` (cheap: the controller uses it to read current positions,
 for example when saving a pose). Robots that support it set `supports.describe` in `hello`.
 
+### `visualize`
+Shows markers in the robot's viewer (Unity draws them on top of the scene). Robots that support it set
+`supports.visualize`; the reply is an `ack` (`ok: false` with a message for unknown links or unsupported kinds).
+```json
+{ "replace": true,
+  "items": [
+    { "id": "chain:base:R_claw", "kind": "chain", "links": ["base", "body", "R_shoulder", "R_arm1"], "end": "tcp:R_claw" },
+    { "id": "tcp:R_claw", "kind": "frame", "parent": "R_claw",
+      "pose": { "position": [0, 0, 0.1], "orientation": [0, 0, 0, 1] }, "label": "TCP R_claw", "style": "tcp" },
+    { "id": "frame:pick", "kind": "frame", "parent": "base",
+      "pose": { "position": [0.3, -0.2, 0.4], "orientation": [0, 0, 0, 1] },
+      "label": "pick", "style": "target", "selectable": true, "selected": true } ] }
+```
+- `replace: true` removes everything shown before; otherwise items update by `id`, and `{ "id": …, "remove": true }`
+  removes one.
+- `frame`: axes (x red, y green, z blue) at `pose` in the `parent` link's frame (ROS convention). It moves with that
+  link. `parent` `""` or `"@scene"` means the viewer's world. `size` is the axis length in metres; `style` is a hint
+  (`tcp`, `target`, `frame`). `selectable` frames can be picked by the user, which sends `selected`; `editable` frames
+  can be moved by the user, which sends `edited`. `name` is the object's name in the viewer's scene
+  (e.g. `TCP_right_arm`).
+- `replace: true` updates listed items in place and removes the others, so an object the user has selected or is
+  dragging is not re-created.
+- `chain`: a line through the origins of `links`, then to the item named by `end` (e.g. the TCP frame).
+
+### `target`
+Creates, moves, deletes or selects a target owned by the robot's scene (robots with `supports.targets`, e.g. Unity,
+where targets are scene objects under `Targets` or attached to other objects). The reply is an `ack`.
+```json
+{ "op": "create", "name": "pick", "reference": "link:base",
+  "pose": { "position": [0.4, -0.2, 0.3], "orientation": [0, 0, 0, 1] }, "parent": "Table/Fixture" }
+{ "op": "update", "id": "target:Targets/pick", "reference": "scene", "pose": { … } }
+{ "op": "delete", "id": "target:Targets/pick" }
+{ "op": "select", "id": "target:Targets/pick" }
+{ "op": "settings", "attach": true, "orientation": "approach" }
+```
+- `reference` says what `pose` is relative to: `scene`, `robot` (the robot instance) or `link:<name>`.
+- `parent` (create): scene path of the object to attach to; default the scene's `Targets` object.
+- `select` highlights the target and, in the Unity Editor, selects it for the Move / Rotate tools.
+- `settings.attach`: Ctrl+click in the viewer attaches new targets to the clicked object instead of `Targets`.
+- `settings.orientation` of Ctrl+click targets: `approach` (default; z into the surface, x towards the robot),
+  `surface` (z out of the surface, x along the view) or `tcp` (the TCP's current orientation).
+  Click targets are named after the clicked object: `<object>_<n>` with the lowest free n.
+
+Such robots list their targets in every `description` (also `tree: false`), with the robot's own location:
+```json
+"robot_pose": { "position": [0, 0, 0], "orientation": [0, 0, 0, 1] },
+"targets": [ { "id": "target:Targets/pick", "name": "pick", "path": "Targets/pick", "parent": "Targets",
+               "pose_in_scene": { … }, "pose_in_robot": { … }, "pose_in_root": { … } } ]
+```
+`pose_in_root` is relative to the description's root link, which is what the controller uses for kinematics.
+
 ### `heartbeat`
 An empty payload.
+
+## Robot ids
+
+`robot_id` must be unique per controller.
+- Unity generates it from the GameObject name (`robot_0625_ros2`) and numbers duplicates in the loaded scenes
+  (`-2`, `-3` …), unless the Robot Id field is set.
+- If a robot announces an id that is already online, and its `instance` differs while the first robot's link is
+  alive, the controller keeps the first robot and answers the newcomer with a `welcome` carrying a free id (`arm-2`).
+  The newcomer reconnects under it and both run normally. A reconnect of the same robot (same `instance`) keeps its id.
+- This needs the connector to tell robots apart by link (WebSocket). Over MQTT and ROS 2 the topics are named after
+  the id, so two robots sharing an id share topics; keep ids unique there.
 
 ## Robot data
 

@@ -22,13 +22,40 @@ import wx
 
 from . import __version__
 from .backend import Backend
-from .ik import IkResult
+from .ik import Chain, IkResult
 
 APP_NAME = "Robotic Toolbox"
+APP_ID = "LogixPlan.RoboticToolbox"     # Windows taskbar grouping / icon (instead of python.exe's)
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "robotic-arm.ico")
 STEPS = [("fine", 0.01, 0.001), ("medium", 0.05, 0.005), ("coarse", 0.2, 0.02)]   # (name, rad, m)
 SLIDER_RANGE = 1000
 LOG_LINES = 2000
 GAP = 4
+
+
+_icons: Optional[wx.IconBundle] = None
+
+
+def app_icons() -> Optional[wx.IconBundle]:
+    """The window / taskbar icon in the usual sizes (the .ico holds one large image; Windows picks per size)."""
+    global _icons
+    if _icons is None and os.path.isfile(ICON_PATH):
+        image = wx.Image(ICON_PATH, wx.BITMAP_TYPE_ICO)
+        if image.IsOk():
+            _icons = wx.IconBundle()
+            for size in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+                _icons.AddIcon(wx.Icon(wx.Bitmap(image.Scale(size, size, wx.IMAGE_QUALITY_HIGH))))
+    return _icons
+
+
+def set_windows_app_id() -> None:
+    """Windows groups a Python app under python.exe (and its icon) in the taskbar unless it has its own id."""
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except Exception:
+            pass
 
 
 def fmt(x: Optional[float], digits: int = 3) -> str:
@@ -39,9 +66,11 @@ def fmt(x: Optional[float], digits: int = 3) -> str:
 
 class LogFrame(wx.Frame):
     def __init__(self, parent: wx.Window, lines: List[str], on_close: Callable[[], None]) -> None:
-        super().__init__(parent, title=f"{APP_NAME} - log", size=parent.FromDIP(wx.Size(640, 300)),
+        super().__init__(parent, title=f"LogixPlan {APP_NAME} - log", size=parent.FromDIP(wx.Size(640, 300)),
                          style=wx.DEFAULT_FRAME_STYLE | wx.FRAME_FLOAT_ON_PARENT)
         self._on_close = on_close
+        if app_icons() is not None:
+            self.SetIcons(app_icons())
         panel = wx.Panel(self)
         self.text = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
         self.text.SetValue("\n".join(lines) + ("\n" if lines else ""))
@@ -331,83 +360,605 @@ class PosesTab(wx.Panel):
         self.refresh()
 
 
-# ── target tab ────────────────────────────────────────────────────────────────
+# ── Tool & Targets tab: chain, TCP, targets ────────────────────────────────────
 
-class TargetTab(wx.Panel):
-    def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
-        super().__init__(parent)
-        self.frame = frame
-        top = wx.BoxSizer(wx.HORIZONTAL)
-        self.tool = wx.Choice(self, size=(self.FromDIP(110), -1))
-        self.tool.Bind(wx.EVT_CHOICE, lambda e: self.fill_bases())
-        self.base = wx.Choice(self, size=(self.FromDIP(110), -1))
-        self.position_only = wx.CheckBox(self, label="Position only")
-        self.position_only.SetToolTip("Ignore the tool orientation")
-        for label, w in [("Tool", self.tool), ("relative to", self.base)]:
-            top.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
-            top.Add(w, 0, wx.RIGHT, 10)
-        top.Add(self.position_only, 0, wx.ALIGN_CENTER_VERTICAL)
+def wheel_scrolls_parent(ctrl: wx.Window) -> None:
+    """The mouse wheel over an unfocused number field scrolls the panel instead of changing the value."""
+    def on_wheel(event: wx.MouseEvent) -> None:
+        if ctrl.HasFocus() or any(c.HasFocus() for c in ctrl.GetChildren()):
+            event.Skip()
+            return
+        parent = ctrl.GetParent()
+        while parent is not None and not isinstance(parent, wx.ScrolledWindow):
+            parent = parent.GetParent()
+        if parent is not None:
+            lines = -event.GetWheelRotation() // max(1, event.GetWheelDelta()) * event.GetLinesPerAction()
+            parent.ScrollLines(lines)
+    for w in [ctrl] + list(ctrl.GetChildren()):
+        w.Bind(wx.EVT_MOUSEWHEEL, on_wheel)
 
-        grid = wx.FlexGridSizer(cols=9, vgap=GAP, hgap=3)
-        self.coord: Dict[str, wx.SpinCtrlDouble] = {}
+
+CUSTOM = "(custom)"
+UNSAVED = "(unsaved)"
+REFERENCE_KEYS = ["chain", "robot", "scene"]
+CLICK_ORIENTATION_KEYS = ["approach", "surface", "tcp"]
+CLICK_ORIENTATION_LABELS = ["Approach (z into surface)", "Surface (z out of surface)", "Keep TCP orientation"]
+REFERENCE_LABELS = ["chain origin", "robot", "scene"]
+
+
+class PoseEditor:
+    """x y z (m) / roll pitch yaw (°) in two rows of three."""
+
+    def __init__(self, parent: wx.Window, on_edit: Optional[Callable[[], None]] = None) -> None:
+        self.sizer = wx.FlexGridSizer(cols=9, vgap=GAP, hgap=3)
+        self.ctrls: Dict[str, wx.SpinCtrlDouble] = {}
         for key, unit, inc, rng, digits in [("x", "m", 0.005, 10, 4), ("y", "m", 0.005, 10, 4), ("z", "m", 0.005, 10, 4),
                                             ("roll", "°", 1, 360, 2), ("pitch", "°", 1, 360, 2), ("yaw", "°", 1, 360, 2)]:
-            ctrl = wx.SpinCtrlDouble(self, min=-rng, max=rng, inc=inc, size=(self.FromDIP(84), -1))
+            ctrl = wx.SpinCtrlDouble(parent, min=-rng, max=rng, inc=inc, size=(parent.FromDIP(82), -1))
             ctrl.SetDigits(digits)
-            self.coord[key] = ctrl
-            grid.Add(wx.StaticText(self, label=key), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
-            grid.Add(ctrl, 0)
-            grid.Add(wx.StaticText(self, label=unit), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+            if on_edit is not None:
+                ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, lambda e: on_edit())
+                ctrl.Bind(wx.EVT_TEXT, lambda e: on_edit())
+            wheel_scrolls_parent(ctrl)
+            self.ctrls[key] = ctrl
+            self.sizer.Add(wx.StaticText(parent, label=key), 0, wx.ALIGN_CENTER_VERTICAL | wx.ALIGN_RIGHT)
+            self.sizer.Add(ctrl, 0)
+            self.sizer.Add(wx.StaticText(parent, label=unit), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self._setting = False
 
+    def get(self):
+        xyz = [self.ctrls[k].GetValue() for k in ("x", "y", "z")]
+        rpy = [math.radians(self.ctrls[k].GetValue()) for k in ("roll", "pitch", "yaw")]
+        return xyz, rpy
+
+    def set(self, xyz, rpy) -> None:
+        self._setting = True
+        try:
+            for k, v in zip(("x", "y", "z"), xyz):
+                self.ctrls[k].SetValue(round(float(v), 4) + 0.0)            # + 0.0: no "-0.0000"
+            for k, v in zip(("roll", "pitch", "yaw"), rpy):
+                self.ctrls[k].SetValue(round(math.degrees(float(v)), 2) + 0.0)
+        finally:
+            self._setting = False
+
+    @property
+    def setting(self) -> bool:
+        return self._setting
+
+
+class TreeDialog(wx.Dialog):
+    """The robot's kinematic tree; pick the chain origin and end."""
+
+    def __init__(self, parent: wx.Window, tree: Dict[str, Any], origin: str, end: str,
+                 on_pick: Callable[[str, str], None]) -> None:
+        super().__init__(parent, title="Kinematic tree", size=parent.FromDIP(wx.Size(380, 480)),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.origin, self.end, self.on_pick = origin, end, on_pick
+        self.tree = wx.TreeCtrl(self, style=wx.TR_DEFAULT_STYLE | wx.TR_HIDE_ROOT | wx.TR_FULL_ROW_HIGHLIGHT)
+        children: Dict[str, List[Dict[str, Any]]] = {}
+        for j in tree.get("joints", []):
+            if j.get("parent") and j.get("child"):
+                children.setdefault(j["parent"], []).append(j)
+        root = self.tree.AddRoot("robot")
+        self.nodes: Dict[str, Any] = {}
+
+        def add(parent_item, link: str, joint: Optional[Dict[str, Any]]) -> None:
+            text = link
+            if joint is not None and joint.get("type") != "fixed":
+                text += f"   ({joint['type']} {joint.get('command_name') or joint.get('name')})"
+            item = self.tree.AppendItem(parent_item, text)
+            self.tree.SetItemData(item, link)
+            self.nodes[link] = item
+            for j in children.get(link, []):
+                add(item, j["child"], j)
+
+        add(root, tree.get("root") or "", None)
+        self.tree.ExpandAll()
+        self.status = wx.StaticText(self, label="")
+        self._mark()
         buttons = wx.BoxSizer(wx.HORIZONTAL)
-        for label, handler in [("Use current", self.use_current), ("Check reachability", self.check),
-                               ("Move to target", self.move)]:
-            btn = wx.Button(self, label=label)
-            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
-            buttons.Add(btn, 0, wx.RIGHT, GAP)
-        buttons.Add(wx.StaticText(self, label="Time"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 6)
-        self.duration = wx.TextCtrl(self, value="auto", size=(self.FromDIP(50), -1))
-        self.duration.SetToolTip("Seconds, or 'auto' (from Speed % and each joint's max velocity)")
-        buttons.Add(self.duration, 0, wx.ALIGN_CENTER_VERTICAL)
-        buttons.Add(wx.StaticText(self, label="s"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 3)
-
-        self.result = wx.StaticText(self, label="")
+        for label, handler in [("Set as origin", self._set_origin), ("Set as end", self._set_end)]:
+            b = wx.Button(self, label=label)
+            b.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            buttons.Add(b, 0, wx.RIGHT, GAP)
+        buttons.AddStretchSpacer()
+        buttons.Add(wx.Button(self, wx.ID_CLOSE, "Close"), 0)
+        self.Bind(wx.EVT_BUTTON, lambda e: self.Destroy(), id=wx.ID_CLOSE)
         s = wx.BoxSizer(wx.VERTICAL)
-        s.Add(top, 0, wx.ALL, GAP)
-        s.Add(grid, 0, wx.ALL, GAP)
-        s.Add(buttons, 0, wx.ALL, GAP)
-        s.Add(self.result, 0, wx.EXPAND | wx.ALL, GAP)
+        s.Add(self.tree, 1, wx.EXPAND | wx.ALL, GAP)
+        s.Add(self.status, 0, wx.LEFT | wx.RIGHT, GAP + 2)
+        s.Add(buttons, 0, wx.EXPAND | wx.ALL, GAP)
         self.SetSizer(s)
 
-    def fill_tools(self) -> None:
-        current = self.tool.GetStringSelection()
-        tools = self.frame.backend.tools()
-        self.tool.Set(tools)
+    def _mark(self) -> None:
+        for link, item in self.nodes.items():
+            self.tree.SetItemBold(item, link in (self.origin, self.end))
+        self.status.SetLabel(f"chain: {self.origin} → {self.end}")
+        if self.end in self.nodes:
+            self.tree.EnsureVisible(self.nodes[self.end])
+
+    def _selected(self) -> Optional[str]:
+        item = self.tree.GetSelection()
+        return self.tree.GetItemData(item) if item.IsOk() else None
+
+    def _set_origin(self) -> None:
+        link = self._selected()
+        if link:
+            self.origin = link
+            self._apply()
+
+    def _set_end(self) -> None:
+        link = self._selected()
+        if link:
+            self.end = link
+            self._apply()
+
+    def _apply(self) -> None:
+        self.on_pick(self.origin, self.end)
+        self._mark()
+
+
+class CartesianTab(wx.ScrolledWindow):
+    def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
+        super().__init__(parent, style=wx.VSCROLL)
+        self.SetScrollRate(0, self.FromDIP(10))
+        self.frame = frame
+
+        # chain
+        chain_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Kinematic chain")
+        sb = chain_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.chain_name = wx.Choice(sb, size=(self.FromDIP(150), -1), choices=[UNSAVED])
+        self.chain_name.SetSelection(0)
+        self.chain_name.SetToolTip("Saved chains (each has its own TCP), or (unsaved) for origin / end picked below")
+        self.chain_name.Bind(wx.EVT_CHOICE, lambda e: self.chain_selected())
+        row.Add(wx.StaticText(sb, label="Chain"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row.Add(self.chain_name, 0, wx.RIGHT, 6)
+        for label, handler, tip in [("Save chain…", self.save_chain, "Name and save this origin → end; creates its TCP"),
+                                    ("Delete", self.delete_chain, "Delete the selected chain")]:
+            b = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            b.SetToolTip(tip)
+            b.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(b, 0, wx.RIGHT, GAP)
+        chain_box.Add(row, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.origin = wx.Choice(sb, size=(self.FromDIP(120), -1))
+        self.origin.SetToolTip("Chain start (origin): targets and new frames are relative to this link")
+        self.origin.Bind(wx.EVT_CHOICE, lambda e: (self.mark_modified(), self.chain_changed()))
+        self.end = wx.Choice(sb, size=(self.FromDIP(120), -1))
+        self.end.SetToolTip("Chain end: the link that carries the TCP")
+        self.end.Bind(wx.EVT_CHOICE, lambda e: (self.fill_origins(), self.mark_modified(), self.chain_changed()))
+        tree_btn = wx.Button(sb, label="Tree…", style=wx.BU_EXACTFIT)
+        tree_btn.SetToolTip("Show the kinematic tree and pick origin / end")
+        tree_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_tree())
+        row.Add(self.origin, 0, wx.RIGHT, 4)
+        row.Add(wx.StaticText(sb, label="→"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row.Add(self.end, 0, wx.RIGHT, 6)
+        row.Add(tree_btn, 0)
+        chain_box.Add(row, 0, wx.ALL, GAP)
+        self.chain_text = wx.StaticText(sb, label="")
+        chain_box.Add(self.chain_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        # TCP
+        tcp_box = wx.StaticBoxSizer(wx.VERTICAL, self, "TCP (tool centre point) in the end link")
+        self.tcp_box = tcp_box.GetStaticBox()
+        sb = self.tcp_box
+        self.tcp = PoseEditor(sb)
+        tcp_box.Add(self.tcp.sizer, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, tip in [("Apply TCP", self.apply_tcp, "Save this TCP offset in the selected chain"),
+                                    ("Reset", self.reset_tcp, "TCP at the end link's origin"),
+                                    ("Edit in Unity", self.edit_tcp_in_viewer,
+                                     "Select the TCP in Unity's Scene view: drag it with Move (W) / Rotate (E); "
+                                     "the new offset is saved here")]:
+            b = wx.Button(sb, label=label)
+            b.SetToolTip(tip)
+            b.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(b, 0, wx.RIGHT, GAP)
+        tcp_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        # target
+        target_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Target")
+        sb = target_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self._target_ids: List[str] = []
+        self.target_choice = wx.Choice(sb, size=(self.FromDIP(150), -1), choices=[CUSTOM])
+        self.target_choice.SetSelection(0)
+        self.target_choice.SetToolTip("A target (Unity: the scene's targets, under 'Targets' or attached to objects), "
+                                      "or (custom) values below. Clicking a target in Unity selects it here")
+        self.target_choice.Bind(wx.EVT_CHOICE, lambda e: self.target_changed())
+        self.reference = wx.Choice(sb, choices=REFERENCE_LABELS)
+        self.reference.SetSelection(0)
+        self.reference.SetToolTip("Coordinates of the values below: the chain origin link, the robot, or the scene")
+        self.reference.Bind(wx.EVT_CHOICE, lambda e: self.reference_changed())
+        self._reference_key = "chain"
+        self.position_only = wx.CheckBox(sb, label="Position only")
+        self.position_only.SetToolTip("Ignore the TCP orientation")
+        row.Add(self.target_choice, 0, wx.RIGHT, 4)
+        row.Add(wx.StaticText(sb, label="in"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row.Add(self.reference, 0, wx.RIGHT, 8)
+        row.Add(self.position_only, 0, wx.ALIGN_CENTER_VERTICAL)
+        target_box.Add(row, 0, wx.ALL, GAP)
+        self.target = PoseEditor(sb, on_edit=self.target_edited)
+        target_box.Add(self.target.sizer, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, tip in [("Use current TCP", self.use_current, "Fill in where the TCP is now"),
+                                    ("Check", self.check, "Check that the TCP can reach the target"),
+                                    ("Move", self.move, "Move the TCP to the target")]:
+            b = wx.Button(sb, label=label)
+            b.SetToolTip(tip)
+            b.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(b, 0, wx.RIGHT, GAP)
+        row.Add(wx.StaticText(sb, label="Time"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 4)
+        self.duration = wx.TextCtrl(sb, value="auto", size=(self.FromDIP(44), -1))
+        self.duration.SetToolTip("Seconds, or 'auto' (from Speed % and each joint's max velocity)")
+        row.Add(self.duration, 0, wx.ALIGN_CENTER_VERTICAL)
+        target_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.result = wx.StaticText(sb, label="")
+        target_box.Add(self.result, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        # targets
+        frames_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Targets")
+        sb = frames_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, tip in [("New from TCP…", self.new_from_tcp, "A new target where the TCP is now"),
+                                    ("New from values…", self.new_from_values, "A new target at the values above"),
+                                    ("Delete", self.delete_target, "Delete the selected target")]:
+            b = wx.Button(sb, label=label)
+            b.SetToolTip(tip)
+            b.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(b, 0, wx.RIGHT, GAP)
+        frames_box.Add(row, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(wx.StaticText(sb, label="Ctrl+click targets:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.click_orientation = wx.Choice(sb, choices=CLICK_ORIENTATION_LABELS)
+        self.click_orientation.SetSelection(0)
+        self.click_orientation.SetToolTip("Orientation of targets made by Ctrl+click in Unity. Approach: z into the "
+                                          "surface, x towards the robot. Surface: z out of the surface. Keep TCP "
+                                          "orientation: only the position comes from the click")
+        self.click_orientation.Bind(wx.EVT_CHOICE, lambda e: self.send_click_settings())
+        row.Add(self.click_orientation, 0)
+        frames_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.attach = wx.CheckBox(sb, label="Ctrl+click in Unity attaches the new target to the clicked object")
+        self.attach.SetToolTip("Off: new targets go under the scene's 'Targets' object. On: they become children "
+                               "of the clicked object and move with it")
+        self.attach.Bind(wx.EVT_CHECKBOX, lambda e: self.send_click_settings())
+        frames_box.Add(self.attach, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.show = wx.CheckBox(sb, label="Show chain and TCP in the viewer (Unity)")
+        self.show.SetValue(True)
+        self.show.Bind(wx.EVT_CHECKBOX, lambda e: self.refresh_markers())
+        frames_box.Add(self.show, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        s = wx.BoxSizer(wx.VERTICAL)
+        for box in (chain_box, tcp_box, target_box, frames_box):
+            s.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, GAP)
+        self.SetSizer(s)
+
+    # ── state ────────────────────────────────────────────────────────────────
+
+    @property
+    def b(self) -> Backend:
+        return self.frame.backend
+
+    def chain_args(self):
+        end = self.end.GetStringSelection()
+        if not end:
+            raise ValueError("no chain - the robot sent no kinematic tree")
+        return end, self.origin.GetStringSelection() or None
+
+    def selected_chain(self) -> Optional[str]:
+        name = self.chain_name.GetStringSelection()
+        return None if name in ("", UNSAVED) else name
+
+    def fill_chains(self, select: Optional[str] = None) -> None:
+        current = select if select is not None else self.chain_name.GetStringSelection()
+        names = [UNSAVED] + sorted(self.b.chains())
+        self.chain_name.Set(names)
+        self.chain_name.SetStringSelection(current if current in names else UNSAVED)
+
+    def chain_selected(self) -> None:
+        """A saved chain was picked: show its origin and end."""
+        name = self.selected_chain()
+        if name is not None:
+            c = self.b.chains().get(name, {})
+            end, origin = c.get("end"), c.get("origin")
+            if end and end not in self.end.GetStrings():
+                self.end.Append(end)
+            if end:
+                self.end.SetStringSelection(end)
+            self.fill_origins()
+            if origin in self.origin.GetStrings():
+                self.origin.SetStringSelection(origin)
+        self.chain_changed()
+
+    def mark_modified(self) -> None:
+        """Origin / end changed by hand: it is no longer the saved chain (Save chain… saves it)."""
+        name = self.selected_chain()
+        if name is None:
+            return
+        c = self.b.chains().get(name, {})
+        if (c.get("origin"), c.get("end")) != (self.origin.GetStringSelection(), self.end.GetStringSelection()):
+            self.chain_name.SetStringSelection(UNSAVED)
+
+    def ref(self) -> str:
+        return REFERENCE_KEYS[max(0, self.reference.GetSelection())]
+
+    def origin_link(self) -> str:
+        _, base = self.chain_args()
+        return base or (self.b.description or {}).get("root")
+
+    def selected_target(self) -> Optional[str]:
+        i = self.target_choice.GetSelection()
+        return self._target_ids[i - 1] if 0 < i <= len(self._target_ids) else None
+
+    def selected_frame(self) -> Optional[str]:
+        """The selected target's frame name, for targets stored here (robots without scene targets)."""
+        t = self.selected_target()
+        return t[len("frame:"):] if t and t.startswith("frame:") else None
+
+    def fill_targets(self, select: Optional[str] = None) -> None:
+        current = select if select is not None else self.selected_target()
+        items = self.b.targets_list()
+        self._target_ids = [tid for tid, _ in items]
+        self.target_choice.Set([CUSTOM] + [name for _, name in items])
+        if current in self._target_ids:
+            self.target_choice.SetSelection(self._target_ids.index(current) + 1)
+        else:
+            self.target_choice.SetSelection(0)
+
+    def robot_changed(self) -> None:
+        current = self.end.GetStringSelection()
+        tools = self.b.tools()
+        self.end.Set(tools)
         if current in tools:
-            self.tool.SetStringSelection(current)
+            self.end.SetStringSelection(current)
         elif tools:
-            self.tool.SetSelection(0)
-        self.fill_bases()
+            self.end.SetSelection(0)
+        self.fill_origins()
+        self.fill_targets()
+        self.send_click_settings()
+        self.fill_chains()
+        if self.selected_chain() is None and self.b.chains():
+            self.chain_name.SetSelection(1)          # first saved chain
+        self.chain_selected()
 
-    def fill_bases(self) -> None:
-        tool = self.tool.GetStringSelection()
-        bases = self.frame.backend.bases_for(tool) if tool else []
-        current = self.base.GetStringSelection()
-        self.base.Set(bases)
+    def fill_origins(self) -> None:
+        end = self.end.GetStringSelection()
+        bases = self.b.bases_for(end) if end else []
+        current = self.origin.GetStringSelection()
+        self.origin.Set(bases)
         if current in bases:
-            self.base.SetStringSelection(current)
+            self.origin.SetStringSelection(current)
         elif bases:
-            root = (self.frame.backend.description or {}).get("root")
-            self.base.SetStringSelection(root if root in bases else bases[0])
+            root = (self.b.description or {}).get("root")
+            self.origin.SetStringSelection(root if root in bases else bases[0])
 
-    def args(self):
-        tool = self.tool.GetStringSelection()
-        if not tool:
-            raise ValueError("no tool - the robot sent no kinematic tree")
-        base = self.base.GetStringSelection() or None
-        xyz = [self.coord[k].GetValue() for k in ("x", "y", "z")]
-        rpy = [math.radians(self.coord[k].GetValue()) for k in ("roll", "pitch", "yaw")]
-        return tool, base, xyz, rpy, self.position_only.GetValue()
+    def chain_changed(self) -> None:
+        try:
+            end, base = self.chain_args()
+            links = self.b.chain_links(end, base)
+            name = self.selected_chain()
+            movable = self.b.chain(end, base, name).joint_names
+            self.chain_text.SetLabel(" → ".join(links) + f"   ({len(movable)} joints)")
+            self.tcp.set(*self.b.tcp_for(end, name))
+            self.tcp_box.SetLabel(f"TCP of chain '{name}' (in {end})" if name
+                                  else f"TCP in {end} (unsaved chain - Save chain… to keep it)")
+        except Exception as exc:
+            self.chain_text.SetLabel(str(exc))
+        self.chain_text.Wrap(max(200, self.frame.GetClientSize().width - self.FromDIP(60)))
+        if self.selected_target():
+            self.target_changed(from_viewer=True)
+        self.FitInside()
+        self.Layout()
+        self.refresh_markers()
+
+    # ── markers ──────────────────────────────────────────────────────────────
+
+    def refresh_markers(self) -> None:
+        if not self.b.can_visualize:
+            return
+        if not self.show.GetValue():
+            self.frame.run(self.b.clear_markers(), what="markers")
+            return
+        try:
+            end, base = self.chain_args()
+        except ValueError:
+            return
+        self.frame.run(self.b.show_markers(end, base, *self._marker_target(), self.selected_chain()), what="markers")
+
+    def _marker_target(self):
+        """(selected frame name, custom target in chain coordinates) for the markers."""
+        if self.selected_target():
+            return self.selected_frame(), None
+        try:
+            xyz, rpy = self.target.get()
+            return None, self.b.convert(xyz, rpy, self.ref(), "chain", self.origin_link())
+        except Exception:
+            return None, None
+
+    def edited_in_viewer(self, payload: Dict[str, Any]) -> None:
+        """The user moved the TCP or a frame in the viewer (Unity's Move / Rotate tools): store the new pose."""
+        try:
+            end, _ = self.chain_args()
+            changed = self.b.apply_edit(payload, end, self.selected_chain())
+        except Exception as exc:
+            self.frame.log(f"edit from the viewer: {exc}")
+            return
+        if changed == "tcp":
+            xyz, rpy = self.b.tcp_for(end, self.selected_chain())
+            self.tcp.set(xyz, rpy)
+            where = f"chain '{self.selected_chain()}'" if self.selected_chain() else f"{end} (unsaved chain)"
+            self.frame.log(f"TCP of {where} moved in the viewer: "
+                           f"({', '.join(f'{v:.4f}' for v in xyz)}) m, "
+                           f"({', '.join(f'{math.degrees(v):.1f}' for v in rpy)})°")
+        elif changed and changed.startswith("frame:"):
+            name = changed[len("frame:"):]
+            self.frame.log(f"frame '{name}' moved in the viewer")
+            if self.selected_target() == changed:
+                self.target_changed(from_viewer=True)
+                return
+        else:
+            return
+        self.refresh_markers()
+
+    def picked_in_viewer(self, item_id: Optional[str], announce: str = "picked in the viewer") -> None:
+        """The user clicked / selected a target in the viewer: make it the target here."""
+        if not item_id or not (item_id.startswith("frame:") or item_id.startswith("target:")):
+            return
+        if item_id not in self._target_ids:
+            self.fill_targets()                      # e.g. just created with Ctrl+click
+        if item_id not in self._target_ids:
+            self._pending_pick = (item_id, announce)  # appears with the next report from the robot
+            return
+        self.fill_targets(select=item_id)
+        self.target_changed(from_viewer=True)
+        self.frame.log(f"target: {self.target_choice.GetStringSelection()} ({announce})")
+
+    def live_update(self, _positions=None) -> None:
+        """Every robot report: new / removed scene targets, and moved targets follow in the fields."""
+        if not self.b.uses_scene_targets:
+            return
+        ids = [tid for tid, _ in self.b.targets_list()]
+        if ids != self._target_ids:
+            self.fill_targets()
+        pending = getattr(self, "_pending_pick", None)
+        if pending and pending[0] in self._target_ids:
+            self._pending_pick = None
+            self.picked_in_viewer(*pending)
+            return
+        tid = self.selected_target()
+        if tid and not any(c.HasFocus() for c in self.target.ctrls.values()):
+            try:
+                xyz, rpy = self.b.target_pose(tid, self.ref(), self.origin_link())
+            except Exception:
+                return
+            old_xyz, old_rpy = self.target.get()
+            if max(abs(a - b) for a, b in zip(list(xyz) + list(rpy), list(old_xyz) + list(old_rpy))) > 1e-4:
+                self.target.set(xyz, rpy)
+
+    # ── TCP ──────────────────────────────────────────────────────────────────
+
+    def apply_tcp(self) -> None:
+        xyz, rpy = self.tcp.get()
+        if self.selected_chain() is None:
+            if wx.MessageBox("A TCP belongs to a saved chain.\n\nSave this chain now?", APP_NAME,
+                             wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES or not self.save_chain():
+                return
+        name = self.selected_chain()
+        try:
+            self.b.set_chain_tcp(name, xyz, rpy)
+            self.frame.log(f"TCP of chain '{name}' saved")
+        except Exception as exc:
+            self.frame.log(f"TCP: {exc}")
+            return
+        self.chain_changed()
+
+    # ── chains ───────────────────────────────────────────────────────────────
+
+    def save_chain(self) -> bool:
+        """Name and save origin → end (creates its TCP). True if saved."""
+        try:
+            end, origin = self.chain_args()
+            origin = origin or (self.b.description or {}).get("root")
+        except Exception as exc:
+            self.frame.log(f"chain: {exc}")
+            return False
+        chains = self.b.chains()
+        default = self.selected_chain() or next((n for n, c in chains.items()
+                                                 if (c.get("origin"), c.get("end")) == (origin, end)), end)
+        name = self.frame.ask_name("Save chain", f"Name for the chain {origin} → {end}:", set(chains), default,
+                                   lambda n: f"A chain named '{n}' already exists "
+                                             f"({chains[n].get('origin')} → {chains[n].get('end')})")
+        if name is None:
+            return False
+        try:
+            self.b.save_chain(name, origin, end)
+        except Exception as exc:
+            self.frame.log(f"chain: {exc}")
+            return False
+        xyz, rpy = self.b.tcp_for(end, name)
+        self.frame.log(f"saved chain '{name}': {origin} → {end}, TCP at "
+                       f"({', '.join(f'{v:.3f}' for v in xyz)}) m in {end}")
+        self.fill_chains(select=name)
+        self.chain_changed()
+        return True
+
+    def delete_chain(self) -> None:
+        name = self.selected_chain()
+        if name is None:
+            wx.MessageBox("Select a saved chain first.", APP_NAME, wx.OK, self)
+            return
+        if wx.MessageBox(f"Delete chain '{name}' and its TCP?", APP_NAME,
+                         wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) != wx.YES:
+            return
+        try:
+            self.b.delete_chain(name)
+            self.frame.log(f"deleted chain '{name}'")
+        except Exception as exc:
+            self.frame.log(f"delete chain: {exc}")
+        self.fill_chains(select=UNSAVED)
+        self.chain_changed()
+
+    def edit_tcp_in_viewer(self) -> None:
+        if not self.b.can_visualize:
+            self.frame.log("the robot has no viewer (Unity robots do)")
+            return
+        try:
+            end, base = self.chain_args()
+        except ValueError as exc:
+            self.frame.log(str(exc))
+            return
+        if not self.show.GetValue():
+            self.show.SetValue(True)
+        key = self.selected_chain() or end
+        self.frame.run(self.b.show_markers(end, base, *self._marker_target(), self.selected_chain(),
+                                           focus=f"tcp:{key}"),
+                       lambda _: self.frame.log(f"TCP_{key} selected in Unity: drag it with Move (W) / Rotate (E)"),
+                       "edit in Unity")
+
+    def reset_tcp(self) -> None:
+        self.tcp.set((0, 0, 0), (0, 0, 0))
+        self.apply_tcp()
+
+    # ── target ───────────────────────────────────────────────────────────────
+
+    def target_changed(self, from_viewer: bool = False) -> None:
+        tid = self.selected_target()
+        if tid is None:
+            self.refresh_markers()
+            return
+        try:
+            self.target.set(*self.b.target_pose(tid, self.ref(), self.origin_link()))
+            self.result.SetLabel(f"{self.target_choice.GetStringSelection()} in {self.reference.GetStringSelection()}")
+        except Exception as exc:
+            self.frame.log(f"target: {exc}")
+        if not from_viewer:
+            self.frame.run(self.b.select_target_in_viewer(tid), what="select in viewer")
+        self.refresh_markers()
+
+    def reference_changed(self) -> None:
+        """Show the same pose in the newly chosen coordinates."""
+        old, new = self._reference_key, self.ref()
+        self._reference_key = new
+        if self.selected_target():
+            self.target_changed(from_viewer=True)
+            return
+        try:
+            xyz, rpy = self.target.get()
+            self.target.set(*self.b.convert(xyz, rpy, old, new, self.origin_link()))
+        except Exception as exc:
+            self.frame.log(f"coordinates: {exc}")
+
+    def target_edited(self) -> None:
+        if not self.target.setting and self.selected_target():
+            self.target_choice.SetSelection(0)   # edited values are no longer the saved target
+
+    def target_args(self):
+        """Arguments for check / move: the target in chain-origin coordinates."""
+        end, base = self.chain_args()
+        xyz, rpy = self.target.get()
+        xyz, rpy = self.b.convert(xyz, rpy, self.ref(), "chain", self.origin_link())
+        return end, base, xyz, rpy, self.position_only.GetValue()
 
     def show_result(self, r: IkResult) -> None:
         if r.reachable:
@@ -418,57 +969,160 @@ class TargetTab(wx.Panel):
                 text += f"; near a limit: {', '.join(r.near_limits)}"
         else:
             text = f"✗ {r.message}"
+            if r.position_reachable is True:
+                text += ("\nThe position alone is reachable - the orientation is what fails. Tick Position only, "
+                         "or turn the target (Unity: Rotate tool, E).")
+            elif r.position_reachable is False:
+                text += "\nThe position itself is out of reach of this chain."
+            hint = self.short_chain_hint(len(r.positions))
+            if hint:
+                text += "\n" + hint
         self.result.SetLabel(text)
-        self.result.Wrap(max(200, self.GetClientSize().width - 2 * GAP))
+        self.result.Wrap(max(200, self.frame.GetClientSize().width - self.FromDIP(60)))
+        self.FitInside()
         self.Layout()
+
+    def short_chain_hint(self, joints: int) -> Optional[str]:
+        """Why a full-pose target may fail: fewer than 6 joints can't set position and orientation freely."""
+        if joints >= 6 or self.position_only.GetValue():
+            return None
+        try:
+            origin = self.origin_link()
+            above = Chain.ancestors(self.b.description, origin)[1:]
+        except Exception:
+            above = []
+        lower = f" (e.g. at '{above[0]}', which adds the joint at '{origin}')" if above else ""
+        return (f"⚠ This chain has only {joints} joint{'s' if joints != 1 else ''}; a full position + orientation "
+                f"target usually needs 6. Start the chain lower{lower}, or tick Position only.")
 
     def use_current(self) -> None:
         try:
-            tool, base, *_ = self.args()
-            xyz, rpy = self.frame.backend.tool_pose(tool, base)
+            end, base = self.chain_args()
+            xyz, rpy = self.b.tool_pose(end, base, self.selected_chain())
+            self.target.set(*self.b.convert(xyz, rpy, "chain", self.ref(), self.origin_link()))
         except Exception as exc:
-            self.frame.log(f"current tool pose: {exc}")
+            self.frame.log(f"current TCP: {exc}")
             return
-        for k, v in zip(("x", "y", "z"), xyz):
-            self.coord[k].SetValue(round(v, 4))
-        for k, v in zip(("roll", "pitch", "yaw"), rpy):
-            self.coord[k].SetValue(round(math.degrees(v), 2))
-        self.result.SetLabel(f"current {tool} pose in {base}")
+        self.target_choice.SetSelection(0)
+        self.result.SetLabel(f"current TCP of {end} in {self.reference.GetStringSelection()}")
+        self.refresh_markers()
 
     def check(self) -> None:
         try:
-            args = self.args()
+            args = self.target_args()
         except Exception as exc:
             self.frame.log(f"check: {exc}")
             return
         self.result.SetLabel("checking…")
-        self.frame.run(self.frame.backend.check_target_async(*args), self.show_result, "check")
+        self.refresh_markers()
+        self.frame.run(self.b.check_target_async(*args, chain_name=self.selected_chain()), self.show_result, "check")
 
     def move(self) -> None:
         try:
-            args = self.args()
+            args = self.target_args()
             text = self.duration.GetValue().strip().lower()
             duration = None if text in ("", "auto") else float(text)
             if duration is not None and duration <= 0:
                 raise ValueError("time must be > 0 s")
         except Exception as exc:
-            self.frame.log(f"move to target: {exc}")
+            self.frame.log(f"move: {exc}")
             return
         self.result.SetLabel("solving…")
+        self.refresh_markers()
 
         def done(r: IkResult) -> None:
             self.show_result(r)
-            self.frame.log(f"→ target {args[0]}" if r.reachable else f"target not sent: {r.message}")
-        f = self.frame
-        f.run(f.backend.move_to_target(*args, duration=duration, speed=f.jog.speed_fraction), done, "move to target")
+            what = self.target_choice.GetStringSelection() if self.selected_target() else "target"
+            self.frame.log(f"→ {what}" if r.reachable else f"not sent: {r.message}")
+        self.frame.run(self.b.move_to_target(*args, duration=duration, speed=self.frame.jog.speed_fraction,
+                                             chain_name=self.selected_chain()), done, "move")
+
+    # ── targets ──────────────────────────────────────────────────────────────
+
+    def send_click_settings(self) -> None:
+        """Ctrl+click settings to the robot's viewer (orientation of new targets, attach to the clicked object)."""
+        if not self.b.uses_scene_targets:
+            return
+        mode = CLICK_ORIENTATION_KEYS[max(0, self.click_orientation.GetSelection())]
+        self.frame.run(self.b.set_click_orientation(mode), what="click target orientation")
+        self.frame.run(self.b.set_attach_new_targets(self.attach.GetValue()), what="attach setting")
+
+    def _new_target(self, title: str, xyz, rpy, reference: str, prefix: str = "target") -> None:
+        names = {name for _, name in self.b.targets_list()}
+        name = self.frame.ask_name(title, "Target name:", names, self.b.suggest_target_name(prefix),
+                                   lambda n: f"A target named '{n}' already exists")
+        if name is None:
+            return
+
+        def done(tid: str) -> None:
+            self.fill_targets()
+            self.picked_in_viewer(tid, announce="new")
+        try:
+            origin = self.origin_link()
+        except Exception as exc:
+            self.frame.log(f"target: {exc}")
+            return
+        self.frame.run(self.b.create_target(name, reference, xyz, rpy, origin), done, "new target")
+
+    def new_from_tcp(self) -> None:
+        try:
+            end, base = self.chain_args()
+            xyz, rpy = self.b.tool_pose(end, base, self.selected_chain())
+        except Exception as exc:
+            self.frame.log(f"target: {exc}")
+            return
+        self._new_target("New target from TCP", xyz, rpy, "chain", prefix=self.selected_chain() or end)
+
+    def new_from_values(self) -> None:
+        xyz, rpy = self.target.get()
+        self._new_target("New target", xyz, rpy, self.ref())
+
+    def delete_target(self) -> None:
+        tid = self.selected_target()
+        if tid is None:
+            wx.MessageBox("Select a target first.", APP_NAME, wx.OK, self)
+            return
+        name = self.target_choice.GetStringSelection()
+        if wx.MessageBox(f"Delete target '{name}'?", APP_NAME, wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+                         self) != wx.YES:
+            return
+
+        def done(_) -> None:
+            self.frame.log(f"deleted target '{name}'")
+            self.target_choice.SetSelection(0)
+            self.refresh_markers()
+        self.frame.run(self.b.delete_target(tid), done, "delete target")
+
+    def show_tree(self) -> None:
+        if not self.b.description:
+            self.frame.log("no kinematic tree from the robot")
+            return
+        end, base = self.end.GetStringSelection(), self.origin.GetStringSelection()
+
+        def pick(origin: str, new_end: str) -> None:
+            if new_end != self.end.GetStringSelection():
+                if new_end not in self.end.GetStrings():
+                    self.end.Append(new_end)
+                self.end.SetStringSelection(new_end)
+                self.fill_origins()
+            if origin in self.origin.GetStrings():
+                self.origin.SetStringSelection(origin)
+            else:
+                self.frame.log(f"'{origin}' is not above '{new_end}' - origin stays {self.origin.GetStringSelection()}")
+            self.mark_modified()
+            self.chain_changed()
+
+        TreeDialog(self, self.b.description, base, end, pick).Show()
 
 
 # ── main window ───────────────────────────────────────────────────────────────
 
 class ToolboxFrame(wx.Frame):
     def __init__(self, backend: Backend) -> None:
-        super().__init__(None, title=APP_NAME)
-        self.SetSize(self.FromDIP(wx.Size(500, 540)))
+        super().__init__(None, title="LogixPlan " +APP_NAME)
+        if app_icons() is not None:
+            self.SetIcons(app_icons())
+        self.SetSize(self.FromDIP(wx.Size(500, 660)))
         self.SetMinSize(self.FromDIP(wx.Size(440, 380)))
         self.backend = backend
         self.robot_ids: List[str] = []
@@ -484,11 +1138,14 @@ class ToolboxFrame(wx.Frame):
         b.on_log = self.log
         b.on_robots = self.on_robots
         b.on_robot_changed = self.on_robot_changed
-        b.on_positions = self.jog.update
+        b.on_positions = lambda pos: (self.jog.update(pos), self.cart.live_update(pos))
         b.on_state = self.on_state
+        b.on_selected = self.cart.picked_in_viewer
+        b.on_edited = self.cart.edited_in_viewer
         self.SetStatusText(f"{b.endpoint}  ·  data: {b.data_dir or 'none (poses disabled)'}", 1)
         self.log(f"{APP_NAME} {__version__} listening on {b.endpoint} - start the robot (Unity: press Play)")
-        self.on_robot_changed()
+        # robots that connected before these handlers were set (the controller starts first) are not missed
+        self.on_robots(b.online_robots())
 
     def _build_menu(self) -> None:
         bar = wx.MenuBar()
@@ -539,10 +1196,10 @@ class ToolboxFrame(wx.Frame):
         self.book = wx.Notebook(panel)
         self.jog = JogTab(self.book, self)
         self.poses = PosesTab(self.book, self)
-        self.target = TargetTab(self.book, self)
+        self.cart = CartesianTab(self.book, self)
         self.book.AddPage(self.jog, "Joint jog")
         self.book.AddPage(self.poses, "Poses")
-        self.book.AddPage(self.target, "Target")
+        self.book.AddPage(self.cart, "Tool && Targets")
 
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(head, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
@@ -582,31 +1239,38 @@ class ToolboxFrame(wx.Frame):
         self.run(self.backend.go_to_pose(name, self.jog.speed_fraction),
                  lambda goal: self.log(f"→ pose '{name}' (goal {goal.goal_id})"), f"pose '{name}'")
 
-    def save_pose_dialog(self) -> None:
-        """Prompt for a name; confirm before replacing an existing pose."""
-        if self.backend.robot is None:
-            self.log("save pose: no robot connected")
-            return
-        existing = set(self.poses.names())
-        name = self.poses.selected() or ""
+    def ask_name(self, title: str, prompt: str, existing: set, default: str = "",
+                 replace_note: Optional[Callable[[str], str]] = None) -> Optional[str]:
+        """Prompt for a name; if it exists, ask before replacing (No = ask again). None if cancelled."""
+        name = default
         while True:
-            with wx.TextEntryDialog(self, "Pose name:", "Save pose", name) as dlg:
+            with wx.TextEntryDialog(self, prompt, title, name) as dlg:
                 if dlg.ShowModal() != wx.ID_OK:
-                    return
+                    return None
                 name = dlg.GetValue().strip()
             if not name:
                 wx.MessageBox("The name must not be empty.", APP_NAME, wx.OK | wx.ICON_WARNING, self)
                 continue
             if name in existing:
-                what = ("This replaces the built-in home pose (all joints 0)" if name in self.poses.builtin
-                        else f"A pose named '{name}' already exists")
-                answer = wx.MessageBox(f"{what}.\n\nReplace it with the current positions?", "Save pose",
+                what = replace_note(name) if replace_note else f"'{name}' already exists"
+                answer = wx.MessageBox(f"{what}.\n\nReplace it?", title,
                                        wx.YES_NO | wx.CANCEL | wx.NO_DEFAULT | wx.ICON_QUESTION, self)
                 if answer == wx.CANCEL:
-                    return
+                    return None
                 if answer == wx.NO:
                     continue          # ask for another name
-            break
+            return name
+
+    def save_pose_dialog(self) -> None:
+        """Prompt for a name; confirm before replacing an existing pose."""
+        if self.backend.robot is None:
+            self.log("save pose: no robot connected")
+            return
+        name = self.ask_name("Save pose", "Pose name:", set(self.poses.names()), self.poses.selected() or "",
+                             lambda n: ("This replaces the built-in home pose (all joints 0)" if n in self.poses.builtin
+                                        else f"A pose named '{n}' already exists"))
+        if name is None:
+            return
 
         def done(path) -> None:
             self.log(f"saved pose '{name}'")
@@ -636,7 +1300,7 @@ class ToolboxFrame(wx.Frame):
         self.names.SetLabel(f"{n['project']} / {n['stage']} / {n['robot']}")
         self.on_state(robot.state or {})
         self.jog.build(list(robot.joints))
-        self.target.fill_tools()
+        self.cart.robot_changed()
         self.poses.refresh()
         self.Layout()
 
@@ -724,6 +1388,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="auto (default) follows the desktop's light / dark setting")
     args = ap.parse_args(argv)
 
+    set_windows_app_id()          # before any window exists
     app = wx.App()
     app.SetAppName(APP_NAME)
     follow_system_theme(app, args.theme)

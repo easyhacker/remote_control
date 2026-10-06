@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace RobotMarket.RemoteControl.Unity
@@ -27,13 +28,54 @@ namespace RobotMarket.RemoteControl.Unity
         public ConnectionSource connectionSource = ConnectionSource.ConfigFile;
         [Tooltip("Used when Connection Source = Controller Url: ws://host:8765/motion, or mqtt://[user:pass@]broker:1883/<prefix>")]
         public string controllerUrl = "ws://localhost:8765/motion";
-        [Tooltip("Identifies this robot to the controller (and names its data folder). Empty = the GameObject name")]
+        [Tooltip("Identifies this robot to the controller (and names its data folder). Empty = generated from the " +
+                 "GameObject name, unique in the scene; the controller also renames robots whose id is already online")]
         public string robotId = "";
         [Tooltip("Human-readable name shown by the controller. Empty = the robot id")]
         public string displayName = "";
 
-        /// <summary>Robot id actually used: the Robot Id field, else the GameObject name.</summary>
-        public string RobotId => !string.IsNullOrWhiteSpace(robotId) ? robotId.Trim() : gameObject.name;
+        /// <summary>Robot id in use: the session's (the controller may have renamed it), else the Robot Id field,
+        /// else one generated from the GameObject name (lowercase, '-' for unusual characters, '-2', '-3' … for
+        /// robots in the loaded scenes that would get the same id).</summary>
+        public string RobotId => Session != null ? Session.RobotId
+            : !string.IsNullOrWhiteSpace(robotId) ? robotId.Trim() : AutoRobotId();
+
+        static string Slug(string name)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var c in (name ?? "").Trim().ToLowerInvariant())
+                sb.Append(char.IsLetterOrDigit(c) && c < 128 || c == '_' || c == '-' ? c : '-');
+            var slug = System.Text.RegularExpressions.Regex.Replace(sb.ToString(), "-{2,}", "-").Trim('-');
+            return slug.Length > 0 ? slug : "robot";
+        }
+
+        static string HierarchyPath(Transform t)
+        {
+            var path = t.GetSiblingIndex().ToString("D4");
+            for (var p = t.parent; p != null; p = p.parent) path = p.GetSiblingIndex().ToString("D4") + "/" + path;
+            return t.gameObject.scene.buildIndex.ToString("D4") + ":" + t.gameObject.scene.name + "/" + path;
+        }
+
+        string AutoRobotId()
+        {
+            var baseId = Slug(gameObject.name);
+            var taken = new HashSet<string>();
+            foreach (var r in FindObjectsByType<RemoteControlRobot>(FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+                if (r != this && !string.IsNullOrWhiteSpace(r.robotId)) taken.Add(r.robotId.Trim());
+            var same = FindObjectsByType<RemoteControlRobot>(FindObjectsInactive.Exclude, FindObjectsSortMode.None)
+                .Where(r => string.IsNullOrWhiteSpace(r.robotId) && Slug(r.gameObject.name) == baseId)
+                .OrderBy(r => HierarchyPath(r.transform), StringComparer.Ordinal).ToList();
+            int n = 1;
+            foreach (var r in same)
+            {
+                var candidate = n == 1 ? baseId : $"{baseId}-{n}";
+                while (taken.Contains(candidate)) candidate = $"{baseId}-{++n}";
+                taken.Add(candidate);
+                n++;
+                if (r == this) return candidate;
+            }
+            return baseId;
+        }
 
         /// <summary>Display name actually used: the Display Name field, else the robot id.</summary>
         public string DisplayName => !string.IsNullOrWhiteSpace(displayName) ? displayName.Trim() : RobotId;
@@ -82,8 +124,26 @@ namespace RobotMarket.RemoteControl.Unity
         [Tooltip("Key that opens / closes the overlay while the Game view has focus (None = click only)")]
         public KeyCode overlayToggleKey = KeyCode.F1;
         [Tooltip("Overlay text size in pixels at 1080p (scaled up for larger Game view resolutions)")]
-        [Range(8, 40)] public int overlayFontSize = 18;
+        [Range(8, 40)] public int overlayFontSize = 14;
         public bool logMessages = false;
+
+        [Header("Markers")]
+        [Tooltip("Draw the frames and kinematic chains the controller sends (TCP, targets, user frames). Click a " +
+                 "frame in the Game view, or select it in the Hierarchy, to pick it as the target in the controller")]
+        public bool showMarkers = true;
+
+        [Header("Targets")]
+        [Tooltip("Ctrl+click on an object creates a target there. On: the target is attached to the clicked object " +
+                 "(moves with it). Off: it goes under the scene's \"Targets\" object")]
+        public bool attachNewTargets = false;
+        [Tooltip("Orientation of targets made by Ctrl+click. Approach: z into the surface, x towards the robot. " +
+                 "Surface: z out of the surface. Keep TCP: the TCP's current orientation")]
+        public ClickOrientation clickTargetOrientation = ClickOrientation.Approach;
+
+        /// <summary>World rotation of the TCP marker currently shown (null if none).</summary>
+        public Quaternion? TcpRotation => _markers?.TcpRotation();
+
+        MarkerLayer _markers;
 
         public RobotSession Session { get; private set; }
 
@@ -156,9 +216,31 @@ namespace RobotMarket.RemoteControl.Unity
                 Stage = StageName,
             };
             var root = articulationRoot;
-            Session.Describer = tree => ArticulationDescriber.Describe(root, driver, tree, gameObject);
+            Session.Describer = tree =>
+            {
+                var d = ArticulationDescriber.Describe(root, driver, tree, gameObject);
+                d["robot_pose"] = ArticulationDescriber.Pose(transform.position, transform.rotation);
+                d["targets"] = ListTargets();
+                return d;
+            };
+            Session.TargetHandler = HandleTarget;
+            RemoteControlTarget.AttachNewTargets = attachNewTargets;
+            RemoteControlTarget.NewTargetOrientation = clickTargetOrientation;
+            RemoteControlTarget.AdoptChildrenOfRoot(gameObject.scene);
             Session.MessageTraced += Trace;
             Session.ConnectionChanged += OnConnectionChanged;
+            Session.Renamed += (oldId, newId) =>
+                Debug.LogWarning($"[RemoteControl] the controller already has a robot '{oldId}' - this robot is now '{newId}'", this);
+            if (showMarkers)
+            {
+                _markers = new MarkerLayer(this);
+                Session.Visualizer = payload => _markers.Apply(payload);
+                _markers.Edited += (itemId, parent, pose) =>
+                {
+                    Session?.Edited(itemId, parent, pose, "editor");
+                    if (logMessages) Debug.Log($"[RemoteControl] edited {itemId} in {parent}: {pose.ToString(Newtonsoft.Json.Formatting.None)}", this);
+                };
+            }
             Session.Start();
             Debug.Log($"[RemoteControl] '{RobotId}' in {Session.Project} / {Session.Stage} with {driver.Joints.Count} joints " +
                       $"({string.Join(", ", driver.Joints.Select(j => j.Name))}) → {_endpoint}", this);
@@ -267,8 +349,218 @@ namespace RobotMarket.RemoteControl.Unity
             else Debug.LogWarning($"[RemoteControl] disconnected: {reason ?? "unknown reason"}", this);
         }
 
+        void LateUpdate()
+        {
+            if (_markers == null) return;
+            _markers.LateUpdate();
+            var focus = _markers.TakeFocusRequest();
+            if (focus != null) FocusInEditor(focus);
+        }
+
+        /// <summary>Editor: select a marker (TCP, frame) and show it in the Scene view, ready for the Move / Rotate
+        /// tools. Clicking it in the Scene view often hits the robot's mesh instead (the TCP sits inside the tool).</summary>
+        public void FocusInEditor(string itemId) => FocusInEditor(_markers?.GameObjectOf(itemId));
+
+        public void FocusInEditor(GameObject go)
+        {
+#if UNITY_EDITOR
+            if (go == null) return;
+            UnityEditor.Selection.activeGameObject = go;
+            UnityEditor.EditorGUIUtility.PingObject(go);
+            var view = UnityEditor.SceneView.lastActiveSceneView;
+            if (view != null)
+            {
+                view.Focus();
+                view.Frame(new Bounds(go.transform.position, Vector3.one * 0.5f), false);
+            }
+            if (UnityEditor.Tools.current != UnityEditor.Tool.Rotate) UnityEditor.Tools.current = UnityEditor.Tool.Move;
+#endif
+        }
+
+        /// <summary>Pick a marker as the target: highlights it and reports `selected` to the controller.</summary>
+        public void SelectMarker(string itemId, string source)
+        {
+            if (_markers == null || !_markers.IsSelectable(itemId)) return;
+            _markers.Highlight(itemId);
+            Session?.Select(itemId, source);
+            if (logMessages) Debug.Log($"[RemoteControl] selected {itemId} ({source})", this);
+        }
+
+        void OnValidate()
+        {
+            RemoteControlTarget.AttachNewTargets = attachNewTargets;
+            RemoteControlTarget.NewTargetOrientation = clickTargetOrientation;
+        }
+
+        /// <summary>Rotation for a target clicked at `point` (uses this robot's settings, TCP and position).</summary>
+        public Quaternion ClickTargetRotation(Vector3 point, Vector3 normal, Vector3 viewForward) =>
+            RemoteControlTarget.Orientation(clickTargetOrientation, point, normal, viewForward, TcpRotation,
+                                            articulationRoot != null ? articulationRoot.transform.position : transform.position);
+
+        // ── targets (owned by the scene) ─────────────────────────────────────
+
+        static JObject LocalPose(Transform frame, Vector3 position, Quaternion rotation) =>
+            ArticulationDescriber.Pose(frame.InverseTransformPoint(position), Quaternion.Inverse(frame.rotation) * rotation);
+
+        /// <summary>The scene's targets with their pose in the scene, in this robot and in its root link
+        /// (ROS convention), for `describe` replies.</summary>
+        JArray ListTargets()
+        {
+            var list = new JArray();
+            foreach (var t in RemoteControlTarget.All)
+            {
+                if (t == null || !t.isActiveAndEnabled) continue;
+                var tr = t.transform;
+                list.Add(new JObject
+                {
+                    ["id"] = t.Id,
+                    ["name"] = t.name,
+                    ["path"] = RemoteControlTarget.PathOf(tr),
+                    ["parent"] = tr.parent != null ? RemoteControlTarget.PathOf(tr.parent) : "",
+                    ["pose_in_scene"] = ArticulationDescriber.Pose(tr.position, tr.rotation),
+                    ["pose_in_robot"] = LocalPose(transform, tr.position, tr.rotation),
+                    ["pose_in_root"] = LocalPose(articulationRoot.transform, tr.position, tr.rotation),
+                });
+            }
+            return list;
+        }
+
+        static Vector3 FromRos(Vector3 v) => new Vector3(-v.y, v.z, v.x);
+        static Quaternion FromRos(Quaternion r) => new Quaternion(r.y, -r.z, -r.x, r.w);
+
+        /// <summary>`target` requests from the controller. op: create (name, reference, pose, parent?),
+        /// update (id, reference, pose), delete (id), select (id), settings (attach).
+        /// reference: "scene", "robot" or "link:&lt;name&gt;"; pose in ROS convention.</summary>
+        string HandleTarget(JObject p)
+        {
+            var op = p["op"]?.Value<string>() ?? "";
+            if (op == "settings")
+            {
+                if (p["attach"] != null) attachNewTargets = RemoteControlTarget.AttachNewTargets = p["attach"].Value<bool>();
+                var orientation = p["orientation"]?.Value<string>();
+                if (orientation != null)
+                {
+                    if (orientation == "approach") clickTargetOrientation = ClickOrientation.Approach;
+                    else if (orientation == "surface") clickTargetOrientation = ClickOrientation.Surface;
+                    else if (orientation == "tcp") clickTargetOrientation = ClickOrientation.KeepTcp;
+                    else return $"unknown orientation '{orientation}' (approach, surface, tcp)";
+                    RemoteControlTarget.NewTargetOrientation = clickTargetOrientation;
+                }
+                return null;
+            }
+            RemoteControlTarget target = null;
+            if (op != "create")
+            {
+                var id = p["id"]?.Value<string>();
+                target = RemoteControlTarget.Find(id);
+                if (target == null) return $"no target '{id}'";
+            }
+            if (op == "delete")
+            {
+                Destroy(target.gameObject);
+                return null;
+            }
+            if (op == "select")
+            {
+                foreach (var t in RemoteControlTarget.All) if (t != null) t.SetHighlighted(t == target);
+                FocusInEditor(target.gameObject);
+                return null;
+            }
+            if (op != "create" && op != "update") return $"unknown target op '{op}'";
+
+            // world pose from the reference frame
+            Transform reference = null;
+            var refName = p["reference"]?.Value<string>() ?? "scene";
+            if (refName == "robot") reference = transform;
+            else if (refName.StartsWith("link:"))
+            {
+                var link = refName.Substring(5);
+                reference = GetComponentsInChildren<Transform>(true).FirstOrDefault(x => x.name == link);
+                if (reference == null) return $"no link '{link}'";
+            }
+            else if (refName != "scene") return $"unknown reference '{refName}'";
+            var pose = p["pose"] as JObject;
+            var pa = pose?["position"] as JArray;
+            var qa = pose?["orientation"] as JArray;
+            var pos = FromRos(pa != null ? new Vector3(pa[0].Value<float>(), pa[1].Value<float>(), pa[2].Value<float>()) : Vector3.zero);
+            var rot = FromRos(qa != null ? new Quaternion(qa[0].Value<float>(), qa[1].Value<float>(), qa[2].Value<float>(), qa[3].Value<float>())
+                                         : Quaternion.identity);
+            if (reference != null)
+            {
+                pos = reference.TransformPoint(pos);
+                rot = reference.rotation * rot;
+            }
+
+            if (op == "create")
+            {
+                var name = p["name"]?.Value<string>();
+                if (string.IsNullOrWhiteSpace(name)) return "target needs a name";
+                Transform parent = null;
+                var parentPath = p["parent"]?.Value<string>();
+                if (!string.IsNullOrEmpty(parentPath))
+                {
+                    parent = FindByPath(parentPath);
+                    if (parent == null) return $"no scene object '{parentPath}'";
+                }
+                parent = parent != null ? parent : RemoteControlTarget.Root(gameObject.scene, true);
+                var existing = parent.Find(name.Trim());
+                var go = existing != null ? existing.gameObject : new GameObject(name.Trim());
+                go.transform.SetParent(parent, true);
+                target = go.GetComponent<RemoteControlTarget>() ?? go.AddComponent<RemoteControlTarget>();
+            }
+            target.transform.SetPositionAndRotation(pos, rot);
+            return null;
+        }
+
+        static Transform FindByPath(string path)
+        {
+            foreach (var go in FindObjectsByType<Transform>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+                if (RemoteControlTarget.PathOf(go) == path) return go;
+            return null;
+        }
+
+        /// <summary>Ctrl+click: make a target on the clicked object (Game view).</summary>
+        void CreateTargetAt(Vector2 guiPosition, Camera cam)
+        {
+            var ray = cam.ScreenPointToRay(new Vector3(guiPosition.x, Screen.height - guiPosition.y, 0));
+            if (!RemoteControlTarget.Pick(ray, out var point, out var normal, out var hitObject))
+            {
+                Debug.Log("[RemoteControl] Ctrl+click: nothing there to put a target on", this);
+                return;
+            }
+            var t = RemoteControlTarget.CreateAt(point, ClickTargetRotation(point, normal, cam.transform.forward),
+                                                 hitObject, attachNewTargets);
+            Debug.Log($"[RemoteControl] new target '{RemoteControlTarget.PathOf(t.transform)}' on {hitObject.name}", this);
+            SelectTarget(t);
+        }
+
+        void SelectTarget(RemoteControlTarget target)
+        {
+            foreach (var t in RemoteControlTarget.All) if (t != null) t.SetHighlighted(t == target);
+            Session?.Select(target.Id, "click");
+            FocusInEditor(target.gameObject);
+        }
+
+        /// <summary>Game view: the target whose origin is nearest a click (within 16 px).</summary>
+        static RemoteControlTarget TargetAt(Vector2 guiPosition, Camera cam)
+        {
+            RemoteControlTarget best = null;
+            float bestDistance = 16f;
+            foreach (var t in RemoteControlTarget.All)
+            {
+                if (t == null || !t.isActiveAndEnabled) continue;
+                var sp = cam.WorldToScreenPoint(t.transform.position);
+                if (sp.z <= 0) continue;
+                float d = Vector2.Distance(new Vector2(sp.x, Screen.height - sp.y), guiPosition);
+                if (d < bestDistance) { bestDistance = d; best = t; }
+            }
+            return best;
+        }
+
         void OnDisable()
         {
+            _markers?.Dispose();
+            _markers = null;
             if (Session == null) return;
             if (_driver?.Trace != null) { _driver.Trace.Flush(); _driver.Trace.Dispose(); _driver.Trace = null; }
             Session.MessageTraced -= Trace;
@@ -279,7 +571,9 @@ namespace RobotMarket.RemoteControl.Unity
 
         void Trace(Envelope env, bool outgoing)
         {
-            if (env.Type == MsgType.Feedback) return;
+            // Routine traffic is never logged: feedback streams during goals, and controllers poll positions with
+            // describe several times a second. Logged with stack traces, they flood the Console and slow the Editor.
+            if (env.Type == MsgType.Feedback || env.Type == MsgType.Describe || env.Type == MsgType.Description) return;
             string line = (outgoing ? "→ " : "← ") + env.Type + (env.GoalId != null ? " " + env.GoalId : "");
             if (env.Type == MsgType.Result || env.Type == MsgType.Rejected || env.Type == MsgType.Ack)
             {
@@ -292,6 +586,19 @@ namespace RobotMarket.RemoteControl.Unity
             if (logMessages) Debug.Log("[RemoteControl] " + line, this);
         }
 
+        const int OverlayMaxChars = 44;
+
+        /// <summary>"localhost:8765/motion", "127.0.0.1:1883/rc": the address without scheme or credentials.</summary>
+        static string ShortAddress(IRobotTransport t)
+        {
+            string url = t is WebSocketRobotTransport ws ? ws.Url : t is MqttRobotTransport mq ? mq.Url : null;
+            if (string.IsNullOrEmpty(url)) return "";
+            int scheme = url.IndexOf("://", StringComparison.Ordinal);
+            if (scheme >= 0) url = url.Substring(scheme + 3);
+            int at = url.IndexOf('@');
+            return at >= 0 ? url.Substring(at + 1) : url;
+        }
+
         static string CommName(IRobotTransport t) =>
             t is MqttRobotTransport ? "MQTT" : t is WebSocketRobotTransport ? "WebSocket" : t?.GetType().Name ?? "none";
 
@@ -302,7 +609,31 @@ namespace RobotMarket.RemoteControl.Unity
 
         void OnGUI()
         {
-            if (!showOverlay || Session == null) return;
+            if (Session == null) return;
+            var ev = Event.current;
+            var cam = Camera.main;
+            if (ev.type == EventType.MouseDown && ev.button == 0 && cam != null)
+            {
+                if (ev.control)
+                {
+                    CreateTargetAt(ev.mousePosition, cam);
+                    ev.Use();
+                    return;
+                }
+                var hitTarget = TargetAt(ev.mousePosition, cam);
+                if (hitTarget != null)
+                {
+                    SelectTarget(hitTarget);
+                    ev.Use();
+                }
+            }
+            var clicked = _markers?.OnGUI(cam);
+            if (clicked != null)
+            {
+                if (_markers.IsSelectable(clicked)) SelectMarker(clicked, "click");   // target in the controller
+                if (_markers.IsEditable(clicked)) FocusInEditor(clicked);              // Move / Rotate it in the Scene view
+            }
+            if (!showOverlay) return;
             if (_style == null || _style.fontSize != overlayFontSize)
                 _style = new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, fontSize = overlayFontSize, wordWrap = false };
 
@@ -323,7 +654,7 @@ namespace RobotMarket.RemoteControl.Unity
             {
                 lines.Add($"[-] {DisplayName} ({RobotId})");
                 lines.Add($"data: {Session.Project} / {Session.Stage} / {RobotId}");
-                lines.Add($"comm: {CommName(Session.Transport)}   {_endpoint}");
+                lines.Add($"comm: {CommName(Session.Transport)} {ShortAddress(Session.Transport)}");
                 lines.Add(StatusText());
                 lines.Add($"state: {ex.State}" + (ex.ActiveGoalId != null ? $"  goal {ex.ActiveGoalId}" : "")
                     + (ex.PauseReason != null ? $"  [{ex.PauseReason}]" : "")
@@ -341,7 +672,7 @@ namespace RobotMarket.RemoteControl.Unity
                     lines.AddRange(_recent.Reverse().Select(l => "  " + l));
                 }
             }
-            var text = string.Join("\n", lines);
+            var text = string.Join("\n", lines.Select(l => l.Length > OverlayMaxChars ? l.Substring(0, OverlayMaxChars - 1) + "…" : l));
             // keep the text readable on high-resolution Game views (e.g. QHD / 4K)
             var scale = Mathf.Max(1f, Screen.height / 1080f);
             var saved = GUI.matrix;

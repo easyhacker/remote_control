@@ -495,6 +495,83 @@ class _Conformance:
         self.assertEqual((await goal.result(timeout=3))["status"], "succeeded")
 
 
+class RobotIdAndViewerTests(unittest.IsolatedAsyncioTestCase):
+    """Duplicate robot ids are renamed by the controller; visualize / selected round trip (Python robot)."""
+
+    async def asyncSetUp(self):
+        self.name = f"ids{id(self)}"
+        self.controller = MotionController(LoopbackControllerConnector(self.name), heartbeat_interval=0.1,
+                                           heartbeat_timeout=0.5)
+        self.renamed = []
+        self.controller.on("robot_renamed", self.renamed.append)
+        await self.controller.start()
+        self.runtimes = []
+
+    async def asyncTearDown(self):
+        for r in self.runtimes:
+            await r.stop()
+        await self.controller.stop()
+
+    async def robot(self, robot_id, **kw):
+        r = RobotRuntime(LoopbackRobotConnector(self.name, reconnect_delay=0.05), FakeDriver(JOINTS), robot_id,
+                         tick_hz=100, decel_time=0.1, **kw)
+        self.runtimes.append(r)
+        await r.start()
+        return r
+
+    async def wait_online(self, robot_id, timeout=5.0):
+        return await self.controller.wait_for_robot(robot_id, timeout=timeout)
+
+    async def test_second_robot_with_same_id_is_renamed(self):
+        first = await self.robot("arm")
+        await self.wait_online("arm")
+        second = await self.robot("arm")
+        await self.wait_online("arm-2")
+        self.assertEqual(second.robot_id, "arm-2")
+        self.assertEqual(first.robot_id, "arm")
+        self.assertTrue(self.controller.robots["arm"].online)
+        self.assertEqual(self.renamed, [{"robot_id": "arm", "new_id": "arm-2"}])
+        third = await self.robot("arm")
+        await self.wait_online("arm-3")
+        self.assertEqual(third.robot_id, "arm-3")
+        goal = await self.controller.robots["arm-2"].execute(["shoulder"], [([0.5], 0.2)])
+        self.assertEqual((await goal.result(timeout=3))["status"], "succeeded")
+        self.assertAlmostEqual(second.driver.positions["shoulder"], 0.5)
+        self.assertEqual(first.driver.positions["shoulder"], 0.0)
+
+    async def test_reconnect_of_same_robot_keeps_its_id(self):
+        r = await self.robot("arm")
+        handle = await self.wait_online("arm")
+        r.connector.simulate_drop(offline_for=0.1)
+        await asyncio.sleep(0.6)
+        self.assertIs(await self.wait_online("arm"), handle)
+        self.assertEqual(r.robot_id, "arm")
+        self.assertEqual(self.renamed, [])
+
+    async def test_visualize_and_selected(self):
+        shown = []
+        await self.robot("viewer-arm", visualizer=shown.append)
+        robot = await self.wait_online("viewer-arm")
+        self.assertTrue(robot.supports["visualize"])
+        items = [{"id": "frame:pick", "kind": "frame", "parent": "base_link",
+                  "pose": {"position": [0.3, 0, 0.2], "orientation": [0, 0, 0, 1]}, "selectable": True}]
+        ack = await robot.visualize(items)
+        self.assertTrue(ack["ok"])
+        self.assertEqual(shown, [{"items": items, "replace": True}])
+        picked = []
+        robot.on("selected", picked.append)
+        self.runtimes[0].select("frame:pick", source="click")
+        await asyncio.sleep(0.2)
+        self.assertEqual(picked, [{"id": "frame:pick", "source": "click"}])
+
+    async def test_visualize_without_viewer_is_refused(self):
+        await self.robot("plain-arm")
+        robot = await self.wait_online("plain-arm")
+        self.assertFalse(robot.supports.get("visualize"))
+        with self.assertRaises(Exception):
+            await robot.visualize([])
+
+
 class _PythonRobot:
     def __init__(self, connector):
         self.connector = connector
@@ -599,6 +676,17 @@ class CSharpRobotTests(_StallTests, _WebSocketController, _Conformance, unittest
     async def start_robot(self, controller):
         return _DotnetRobot(self.url)
 
+    async def test_second_robot_with_same_id_is_renamed(self):
+        second = _DotnetRobot(self.url)
+        try:
+            renamed = await self.controller.wait_for_robot(ROBOT_ID + "-2", timeout=20)
+            self.assertTrue(renamed.online)
+            self.assertTrue(self.robot.online)          # the first keeps its id
+            goal = await renamed.execute(["elbow"], [([0.4], 0.2)])
+            self.assertEqual((await goal.result(timeout=5))["status"], "succeeded")
+        finally:
+            await second.stop()
+
 
 try:
     import paho.mqtt  # noqa: F401
@@ -631,7 +719,7 @@ class _MqttBroker:
 
     async def drop_link(self):
         if self.broker:   # the robot's network fails: broker publishes its last will
-            self.assertTrue(await self.broker.kick(f"rc-robot-{ROBOT_ID}"))
+            self.assertTrue(await self.broker.kick(f"rc-robot-{ROBOT_ID}-*"))
         else:
             await super().drop_link()
 

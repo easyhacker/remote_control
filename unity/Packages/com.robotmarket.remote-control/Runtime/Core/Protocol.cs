@@ -22,6 +22,8 @@ namespace RobotMarket.RemoteControl
         public const string State = "state";
         public const string Ack = "ack";
         public const string Description = "description";
+        public const string Selected = "selected";
+        public const string Edited = "edited";
         // controller → robot
         public const string Welcome = "welcome";
         public const string Execute = "execute";
@@ -30,6 +32,8 @@ namespace RobotMarket.RemoteControl
         public const string Cancel = "cancel";
         public const string Stop = "stop";
         public const string Describe = "describe";
+        public const string Visualize = "visualize";
+        public const string Target = "target";
         // both
         public const string Heartbeat = "heartbeat";
     }

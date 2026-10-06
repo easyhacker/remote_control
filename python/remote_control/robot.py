@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .executor import JointDriver, MotionExecutor
@@ -31,7 +32,10 @@ class RobotRuntime:
                  software: str = "remote-control-py/0.1", project: str = "", stage: str = "",
                  tree: Optional[Mapping[str, Any]] = None,
                  base_pose: Optional[Mapping[str, Any]] = None,
-                 describer: Optional[Callable[[bool], Dict[str, Any]]] = None) -> None:
+                 describer: Optional[Callable[[bool], Dict[str, Any]]] = None,
+                 visualizer: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 target_handler: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+                 target_lister: Optional[Callable[[], List[Dict[str, Any]]]] = None) -> None:
         self.connector = connector
         self.driver = driver
         self.robot_id = robot_id
@@ -42,6 +46,11 @@ class RobotRuntime:
         self.tree = tree
         self.base_pose = dict(base_pose or IDENTITY_POSE)
         self.describer = describer
+        self.visualizer = visualizer
+        self.target_handler = target_handler      # `target` requests (scene-owned targets); returns an error or None
+        self.target_lister = target_lister        # targets for `describe` replies
+        self.instance = uuid.uuid4().hex[:12]     # tells a reconnect of this robot from another robot with the same id
+        self.on_renamed: Optional[Callable[[str, str], Any]] = None   # (old_id, new_id)
         self.tick_period = 1.0 / tick_hz
         self.executor = MotionExecutor(driver, self._emit, decel_time)
         self.heartbeat_interval = 0.5
@@ -98,7 +107,9 @@ class RobotRuntime:
             "software": self.software,
             "joints": [j.to_dict() for j in self.driver.joints()],
             "supports": {"pause": True, "report_points": True, "report_progress": True,
-                         "pose_targets": False, "describe": True},
+                         "pose_targets": False, "describe": True, "visualize": self.visualizer is not None,
+                         "targets": self.target_handler is not None},
+            "instance": self.instance,
             "project": self.project,
             "stage": self.stage,
             "state": self.executor.state_payload(),
@@ -114,6 +125,8 @@ class RobotRuntime:
             "positions": {j.name: pos.get(j.name) for j in joints},
             "state": self.executor.state,
         }
+        if self.target_lister is not None:
+            d["targets"] = self.target_lister()
         if self.describer is not None:
             d.update(self.describer(tree))
             return d
@@ -161,10 +174,29 @@ class RobotRuntime:
             return
         self._last_rx = time.monotonic()
         if env.type == MsgType.WELCOME:
-            self.welcomed = True
             p = env.payload
+            new_id = p.get("robot_id")
+            if new_id and new_id != self.robot_id and p.get("instance") in (None, self.instance):
+                # the controller already has a robot with our id: reconnect under the id it assigned
+                asyncio.ensure_future(self.rename(new_id))
+                return
+            self.welcomed = True
             self.heartbeat_interval = float(p.get("heartbeat_interval", self.heartbeat_interval))
             self.heartbeat_timeout = float(p.get("heartbeat_timeout", self.heartbeat_timeout))
+        elif env.type in (MsgType.VISUALIZE, MsgType.TARGET):
+            handler = self.visualizer if env.type == MsgType.VISUALIZE else self.target_handler
+            ok, message = True, ""
+            if handler is None:
+                ok, message = False, f"{env.type} not supported"
+            else:
+                try:
+                    error = handler(dict(env.payload))
+                    if isinstance(error, str) and error:
+                        ok, message = False, error
+                except Exception as exc:
+                    log.exception("%s failed", env.type)
+                    ok, message = False, f"{env.type} failed: {exc}"
+            self._emit(MsgType.ACK, None, {"ref_seq": env.seq, "ref_type": env.type, "ok": ok, "message": message})
         elif env.type == MsgType.DESCRIBE:
             try:
                 body = {"ok": True, "message": "", **self.describe(bool(env.payload.get("tree", True)))}
@@ -175,6 +207,28 @@ class RobotRuntime:
         elif env.type != MsgType.HEARTBEAT:
             self.executor.handle(env)
         await self._flush()
+
+    def select(self, item_id: str, source: str = "user") -> None:
+        """Tell the controller the user picked a visualized item (e.g. clicked a frame in the viewer)."""
+        self._emit(MsgType.SELECTED, None, {"id": item_id, "source": source})
+
+    def edited(self, item_id: str, parent: str, pose: Dict[str, Any], source: str = "user") -> None:
+        """Tell the controller the user moved an editable item (pose in the parent link, ROS convention)."""
+        self._emit(MsgType.EDITED, None, {"id": item_id, "parent": parent, "pose": pose, "source": source})
+
+    async def rename(self, new_id: str) -> None:
+        """Switch to a new robot_id (assigned by the controller) and reconnect under it."""
+        old = self.robot_id
+        log.warning("robot_id '%s' is taken on this controller - reconnecting as '%s'", old, new_id)
+        self.welcomed = False
+        await self.connector.stop()
+        self.robot_id = new_id
+        self.connector.bind(new_id)
+        await self.connector.start()
+        if self.on_renamed is not None:
+            r = self.on_renamed(old, new_id)
+            if asyncio.iscoroutine(r):
+                await r
 
     # ── loop ─────────────────────────────────────────────────────────────────
 

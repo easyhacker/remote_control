@@ -18,7 +18,28 @@ namespace RobotMarket.RemoteControl
         public const string DefaultName = "default";
         public const string Frame = "ros: x forward, y left, z up; metres; orientation quaternion [x, y, z, w]";
 
-        public string RobotId { get; }
+        /// <summary>The id the controller knows this robot by; it can change once if the controller already
+        /// has a robot with the requested id (see <see cref="Renamed"/>).</summary>
+        public string RobotId { get; private set; }
+
+        /// <summary>Random per session: tells the controller a reconnect of this robot from a different robot
+        /// that happens to use the same id.</summary>
+        public string Instance { get; } = Guid.NewGuid().ToString("N").Substring(0, 12);
+
+        /// <summary>Raised on the Update thread when the controller assigned a new id (old, new).</summary>
+        public event Action<string, string> Renamed;
+
+        /// <summary>
+        /// Shows / updates / removes markers sent by the controller (`visualize` payload: items + replace).
+        /// Return null on success or an error message. Leave null if this robot has no viewer.
+        /// </summary>
+        public Func<JObject, string> Visualizer;
+
+        /// <summary>
+        /// Creates / updates / deletes targets owned by the robot's scene (`target` payload: op, …). Return null on
+        /// success or an error message. Leave null if targets live with the controller.
+        /// </summary>
+        public Func<JObject, string> TargetHandler;
         public string DisplayName { get; }
 
         /// <summary>Names reported in hello / description; the controller files this robot's data under
@@ -171,8 +192,9 @@ namespace RobotMarket.RemoteControl
             ["supports"] = new JObject
             {
                 ["pause"] = true, ["report_points"] = true, ["report_progress"] = true, ["pose_targets"] = false,
-                ["describe"] = true,
+                ["describe"] = true, ["visualize"] = Visualizer != null, ["targets"] = TargetHandler != null,
             },
+            ["instance"] = Instance,
             ["project"] = Project,
             ["stage"] = Stage,
             ["state"] = Executor.StatePayload(),
@@ -247,9 +269,31 @@ namespace RobotMarket.RemoteControl
 
             if (env.Type == MsgType.Welcome)
             {
+                var newId = env.Payload["robot_id"]?.Value<string>();
+                var forInstance = env.Payload["instance"]?.Value<string>();
+                if (!string.IsNullOrEmpty(newId) && newId != RobotId && (forInstance == null || forInstance == Instance))
+                {
+                    Rename(newId);   // the controller already has a robot with our id
+                    return;
+                }
                 Welcomed = true;
                 HeartbeatInterval = env.Payload["heartbeat_interval"]?.Value<double>() ?? HeartbeatInterval;
                 HeartbeatTimeout = env.Payload["heartbeat_timeout"]?.Value<double>() ?? HeartbeatTimeout;
+            }
+            else if (env.Type == MsgType.Visualize || env.Type == MsgType.Target)
+            {
+                var handler = env.Type == MsgType.Visualize ? Visualizer : TargetHandler;
+                string error;
+                if (handler == null) error = env.Type + " not supported";
+                else
+                {
+                    try { error = handler(env.Payload); }
+                    catch (Exception e) { error = env.Type + " failed: " + e.Message; }
+                }
+                _outbox.Add((MsgType.Ack, null, new JObject
+                {
+                    ["ref_seq"] = env.Seq, ["ref_type"] = env.Type, ["ok"] = error == null, ["message"] = error ?? "",
+                }));
             }
             else if (env.Type == MsgType.Describe)
             {
@@ -271,6 +315,34 @@ namespace RobotMarket.RemoteControl
             {
                 Executor.Handle(env);
             }
+        }
+
+        /// <summary>Report that the user picked a visualized item (e.g. clicked a frame).</summary>
+        public void Select(string itemId, string source = "user")
+        {
+            _outbox.Add((MsgType.Selected, null, new JObject { ["id"] = itemId, ["source"] = source }));
+            Flush();
+        }
+
+        /// <summary>Report that the user moved an editable item: pose in its parent link (ROS convention).</summary>
+        public void Edited(string itemId, string parent, JObject pose, string source = "user")
+        {
+            _outbox.Add((MsgType.Edited, null, new JObject
+            {
+                ["id"] = itemId, ["parent"] = parent, ["pose"] = pose, ["source"] = source,
+            }));
+            Flush();
+        }
+
+        void Rename(string newId)
+        {
+            var old = RobotId;
+            Welcomed = false;
+            Transport.Stop();
+            RobotId = newId;
+            Transport.Bind(newId);
+            Transport.Start();
+            Renamed?.Invoke(old, newId);
         }
 
         void Flush()

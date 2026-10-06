@@ -127,10 +127,15 @@ The controller needs the directory: `MotionController(connector, data_dir=data_d
 A wxPython controller with native widgets on Windows, macOS and Linux:
 - **Joint jog:** click a step, or hold to move continuously; drag a slider to go to a value.
 - **Poses:** save, go to and delete, in the same `poses.json` as `controller_demo.py`.
-- **Targets:** the tool pose (x y z, roll pitch yaw) relative to any link above it, with a reachability check and
-  *Move to target*. Inverse kinematics runs in the Toolbox (numpy, damped least squares within the joint limits)
-  on the kinematic tree from `describe`, so it works for any robot that supports describe. It does not check
-  collisions.
+- **Tool & Targets:** pick the kinematic chain's start (origin) and end link, from the dropdowns or the kinematic tree view,
+  and **Save chain…** under a name. Saving creates the chain's TCP (tool centre point), which you then offset and
+  *Apply*. Each saved chain keeps its own TCP. The target can be typed in or be a saved **frame**; *From TCP…* saves where the TCP is
+  now. *Check* tests reachability, *Move* goes there. Inverse kinematics runs in the Toolbox (numpy, damped least
+  squares within the joint limits) on the kinematic tree from `describe`, so any robot that supports describe works.
+  Collisions are not checked.
+- **Viewer:** robots with `supports.visualize` (Unity) draw the chain, the TCP and the frames. Clicking a frame in
+  Unity's Game view, or selecting it in the Hierarchy, makes it the target in the Toolbox. TCPs and frames are stored
+  in the robot's data folder (`chains.json` with each chain's TCP, `frames.json`).
 
 ```bash
 cd python

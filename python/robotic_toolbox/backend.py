@@ -18,7 +18,7 @@ import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -26,7 +26,9 @@ from remote_control import (ConfigError, GoalHandle, MotionController, RobotHand
                             controller_connector_from_config, controller_connector_from_url,
                             data_dir_from_config, load_system_config, system_config_path)
 
-from .ik import Chain, IkResult, pose_from_xyz_rpy, xyz_rpy_from_pose
+from remote_control.kinematics import forward_kinematics
+
+from .ik import Chain, IkResult, pose_from_xyz_rpy, rpy_matrix, xyz_rpy_from_pose
 
 Post = Callable[[Callable[[], None]], Any]
 
@@ -54,6 +56,7 @@ class Backend:
         self.robot: Optional[RobotHandle] = None
         self.description: Optional[Dict[str, Any]] = None
         self.positions: Dict[str, float] = {}
+        self.live: Dict[str, Any] = {}    # latest describe(tree=False): base / robot pose, scene targets
         self.goal: Optional[GoalHandle] = None          # last goal sent from the toolbox
         self._jog_targets: Dict[str, float] = {}
         self._listening: set = set()
@@ -67,6 +70,8 @@ class Backend:
         self.on_robot_changed: Callable[[], None] = lambda: None
         self.on_positions: Callable[[Dict[str, float]], None] = lambda pos: None
         self.on_state: Callable[[Dict[str, Any]], None] = lambda state: None
+        self.on_selected: Callable[[Optional[str]], None] = lambda item_id: None   # picked in the robot's viewer
+        self.on_edited: Callable[[Dict[str, Any]], None] = lambda payload: None    # moved in the robot's viewer
 
     # ── thread plumbing ──────────────────────────────────────────────────────
 
@@ -194,6 +199,8 @@ class Backend:
             if robot.robot_id not in self._listening:
                 self._listening.add(robot.robot_id)
                 robot.on("state", lambda st, r=robot: r is self.robot and self._emit(self.on_state, dict(st)))
+                robot.on("selected", lambda p, r=robot: r is self.robot and self._emit(self.on_selected, p.get("id")))
+                robot.on("edited", lambda p, r=robot: r is self.robot and self._emit(self.on_edited, dict(p)))
         try:
             self.description = await robot.describe(tree=True)
         except Exception as exc:
@@ -210,7 +217,12 @@ class Backend:
             if robot is None or not robot.online:
                 continue
             try:
-                pos = await robot.current_positions()
+                if robot.supports.get("describe"):
+                    live = await robot.describe(tree=False)
+                    pos = {k: float(v) for k, v in live.get("positions", {}).items() if v is not None}
+                    self.live = live
+                else:
+                    pos = await robot.current_positions()
             except Exception:
                 continue
             self.positions = pos
@@ -377,39 +389,442 @@ class Backend:
             positions = robot.get_pose(name)
         return await self.move_joints(positions, speed=speed, label=f"pose '{name}'")
 
-    # ── targets (IK) ─────────────────────────────────────────────────────────
+    # ── chains, TCP, frames (Cartesian) ──────────────────────────────────────
 
-    def chain(self, tool: str, base: Optional[str] = None) -> Chain:
+    TCP_FILE = "tcp.json"          # TCP per end link, for chains that were not saved under a name
+    FRAMES_FILE = "frames.json"
+    CHAINS_FILE = "chains.json"    # named chains: origin, end and their own TCP
+
+    def _tree(self) -> Dict[str, Any]:
         if not self.description or not self.description.get("joints"):
             raise RuntimeError("the robot sent no kinematic tree (Robot → Describe & save to retry)")
-        return Chain.from_tree(self.description, tool, base)
+        return self.description
+
+    def _doc(self, name: str, key: str) -> Dict[str, Any]:
+        robot = self.robot
+        if robot is None or self.data_dir is None:
+            return {}
+        return dict(robot.store.load_doc(name).get(key, {}))
+
+    def _save_doc(self, name: str, key: str, value: Mapping[str, Any]) -> Path:
+        robot = self._require_robot()
+        if self.data_dir is None:
+            raise RuntimeError('no data folder - set "data_dir" in remote_control.json')
+        return robot.store.save_doc(name, {key: dict(sorted(value.items()))})
+
+    # tool centre point (per chain end link)
+
+    def tcp(self, end: str):
+        """(xyz, rpy) of the TCP in the end link's frame; zero if none was set."""
+        t = self._doc(self.TCP_FILE, "tcp").get(end) or {}
+        return tuple(t.get("xyz", (0.0, 0.0, 0.0))), tuple(t.get("rpy", (0.0, 0.0, 0.0)))
+
+    def set_tcp(self, end: str, xyz, rpy) -> Path:
+        tcps = self._doc(self.TCP_FILE, "tcp")
+        if all(abs(v) < 1e-12 for v in list(xyz) + list(rpy)):
+            tcps.pop(end, None)
+        else:
+            tcps[end] = {"xyz": [float(v) for v in xyz], "rpy": [float(v) for v in rpy]}
+        return self._save_doc(self.TCP_FILE, "tcp", tcps)
+
+    # named chains
+
+    def chains(self) -> Dict[str, Dict[str, Any]]:
+        """Saved chains: name → {"origin", "end", "tcp": {"xyz", "rpy"}, "saved_at"}."""
+        return self._doc(self.CHAINS_FILE, "chains")
+
+    def save_chain(self, name: str, origin: str, end: str) -> Path:
+        """Save (or replace) chain `name` from `origin` to `end` and give it a TCP: kept if the chain already
+        ended at the same link, else taken from an earlier TCP for that end link, else at the end link's origin."""
+        name = name.strip()
+        if not name:
+            raise ValueError("chain name must not be empty")
+        tree = self._tree()
+        Chain.path(tree, origin, end)          # raises if origin is not above end
+        chains = self.chains()
+        old = chains.get(name)
+        if old is not None and old.get("end") == end and old.get("tcp"):
+            tcp = old["tcp"]
+        else:
+            xyz, rpy = self.tcp(end)
+            tcp = {"xyz": list(xyz), "rpy": list(rpy)}
+        chains[name] = {"origin": origin, "end": end, "tcp": tcp, "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        return self._save_doc(self.CHAINS_FILE, "chains", chains)
+
+    def delete_chain(self, name: str) -> None:
+        chains = self.chains()
+        if name not in chains:
+            raise KeyError(f"no chain '{name}'")
+        del chains[name]
+        self._save_doc(self.CHAINS_FILE, "chains", chains)
+
+    def set_chain_tcp(self, name: str, xyz, rpy) -> Path:
+        chains = self.chains()
+        if name not in chains:
+            raise KeyError(f"no chain '{name}' - save the chain first")
+        chains[name]["tcp"] = {"xyz": [float(v) for v in xyz], "rpy": [float(v) for v in rpy]}
+        return self._save_doc(self.CHAINS_FILE, "chains", chains)
+
+    def tcp_for(self, end: str, chain_name: Optional[str] = None):
+        """TCP (xyz, rpy) in the end link: the named chain's, else the end link's (unsaved chains)."""
+        c = self.chains().get(chain_name) if chain_name else None
+        if c is not None and c.get("end") == end and c.get("tcp"):
+            return tuple(c["tcp"].get("xyz", (0, 0, 0))), tuple(c["tcp"].get("rpy", (0, 0, 0)))
+        return self.tcp(end)
+
+    def chain(self, tool: str, base: Optional[str] = None, chain_name: Optional[str] = None) -> Chain:
+        """Chain from base to the end link `tool`, ending at its TCP (the named chain's, if given)."""
+        xyz, rpy = self.tcp_for(tool, chain_name)
+        return Chain.from_tree(self._tree(), tool, base, tcp=pose_from_xyz_rpy(xyz, rpy))
 
     def tools(self) -> List[str]:
-        return Chain.tool_candidates(self.description) if self.description else []
+        """End links to offer: chain ends first (last rotating joint of each branch), then every other link."""
+        if not self.description:
+            return []
+        ends = Chain.tool_candidates(self.description)
+        root = self.description.get("root")
+        rest = [l for l in Chain.links(self.description) if l not in ends and l != root]
+        return ends + rest
 
     def bases_for(self, tool: str) -> List[str]:
-        """Links a target can be relative to: the tool's ancestors (root first)."""
+        """Links a chain to `tool` can start at: its ancestors (root first)."""
         if not self.description:
             return []
         return list(reversed(Chain.ancestors(self.description, tool)[1:]))
 
-    def tool_pose(self, tool: str, base: Optional[str] = None):
-        """(xyz, rpy) of the tool in `base` at the latest measured positions."""
-        return xyz_rpy_from_pose(self.chain(tool, base).tool_pose(self.positions))
+    def chain_links(self, tool: str, base: Optional[str]) -> List[str]:
+        tree = self._tree()
+        return Chain.path(tree, base or tree.get("root"), tool)
 
-    def check_target(self, tool: str, base: Optional[str], xyz, rpy, position_only: bool) -> IkResult:
-        chain = self.chain(tool, base)
-        return chain.solve(pose_from_xyz_rpy(xyz, rpy), self.positions, position_only=position_only)
+    def tool_pose(self, tool: str, base: Optional[str] = None, chain_name: Optional[str] = None):
+        """(xyz, rpy) of the TCP in `base` at the latest measured positions."""
+        return xyz_rpy_from_pose(self.chain(tool, base, chain_name).tool_pose(self.positions))
 
-    async def check_target_async(self, tool: str, base: Optional[str], xyz, rpy, position_only: bool) -> IkResult:
+    # link poses (forward kinematics over the whole tree)
+
+    def _link_pose(self, link: str) -> np.ndarray:
+        """4x4 pose of a link in the tree root's frame at the latest positions."""
+        poses = forward_kinematics(self._tree(), self.positions)
+        if link not in poses:
+            raise KeyError(f"unknown link '{link}'")
+        p = poses[link]
+        x, y, z, w = p["orientation"]
+        rot = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+        t = np.eye(4)
+        t[:3, :3] = rot
+        t[:3, 3] = p["position"]
+        return t
+
+    def express(self, xyz, rpy, parent: str, base: str):
+        """A pose given in `parent` expressed in `base` (both links of the robot)."""
+        t = np.linalg.inv(self._link_pose(base)) @ self._link_pose(parent) @ pose_from_xyz_rpy(xyz, rpy)
+        return xyz_rpy_from_pose(t)
+
+    # named frames
+
+    def frames(self) -> Dict[str, Dict[str, Any]]:
+        return self._doc(self.FRAMES_FILE, "frames")
+
+    def save_frame(self, name: str, parent: str, xyz, rpy) -> Path:
+        name = name.strip()
+        if not name:
+            raise ValueError("frame name must not be empty")
+        frames = self.frames()
+        frames[name] = {"parent": parent, "xyz": [float(v) for v in xyz], "rpy": [float(v) for v in rpy],
+                        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        return self._save_doc(self.FRAMES_FILE, "frames", frames)
+
+    def frame_from_tcp(self, name: str, tool: str, base: Optional[str], chain_name: Optional[str] = None) -> Path:
+        """Save the TCP's current pose as frame `name`, relative to the chain origin `base`."""
+        base = base or self._tree().get("root")
+        xyz, rpy = self.tool_pose(tool, base, chain_name)
+        return self.save_frame(name, base, xyz, rpy)
+
+    def delete_frame(self, name: str) -> None:
+        frames = self.frames()
+        if name not in frames:
+            raise KeyError(f"no frame '{name}'")
+        del frames[name]
+        self._save_doc(self.FRAMES_FILE, "frames", frames)
+
+    def frame_in(self, name: str, base: str):
+        """(xyz, rpy) of frame `name` in `base`."""
+        f = self.frames()[name]
+        return self.express(f["xyz"], f["rpy"], f["parent"], base)
+
+    # targets
+
+    def check_target(self, tool: str, base: Optional[str], xyz, rpy, position_only: bool,
+                     chain_name: Optional[str] = None) -> IkResult:
+        chain = self.chain(tool, base, chain_name)
+        target = pose_from_xyz_rpy(xyz, rpy)
+        result = chain.solve(target, self.positions, position_only=position_only)
+        if not result.reachable and not position_only:
+            # tell the user which part fails: the position, or only the orientation
+            result.position_reachable = chain.solve(target, self.positions, position_only=True, restarts=4).reachable
+        return result
+
+    async def check_target_async(self, tool: str, base: Optional[str], xyz, rpy, position_only: bool,
+                                 chain_name: Optional[str] = None) -> IkResult:
         """check_target on a worker thread (an unreachable target tries several starts)."""
         return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: self.check_target(tool, base, xyz, rpy, position_only))
+            None, lambda: self.check_target(tool, base, xyz, rpy, position_only, chain_name))
 
     async def move_to_target(self, tool: str, base: Optional[str], xyz, rpy, position_only: bool,
-                             duration: Optional[float] = None, speed: float = 0.5) -> IkResult:
-        result = await self.check_target_async(tool, base, xyz, rpy, position_only)
+                             duration: Optional[float] = None, speed: float = 0.5,
+                             chain_name: Optional[str] = None) -> IkResult:
+        result = await self.check_target_async(tool, base, xyz, rpy, position_only, chain_name)
         if not result.reachable:
             return result
-        await self.move_joints(result.positions, duration, speed, label=f"target {tool}")
+        await self.move_joints(result.positions, duration, speed, label=f"target {chain_name or tool}")
         return result
+
+    # target references and scene-owned targets
+    #
+    # A target pose can be given in three references: "chain" (the chain origin link), "robot" (the robot
+    # instance in its scene) or "scene" (the scene / world). Robots with supports.targets (Unity) own their targets
+    # as scene objects and report them in describe replies; other robots use the frames stored here (frames.json).
+
+    REFERENCES = ("chain", "robot", "scene")
+
+    @property
+    def uses_scene_targets(self) -> bool:
+        return self.robot is not None and bool(self.robot.supports.get("targets"))
+
+    def _live_pose(self, key: str) -> np.ndarray:
+        pose = self.live.get(key) or self.live.get("base_pose") or {}
+        return pose_from_xyz_rpy(*pose_to_xyz_rpy(pose)) if pose else np.eye(4)
+
+    def to_root(self, xyz, rpy, reference: str, origin: str) -> np.ndarray:
+        """4x4 pose in the tree root link's frame, from xyz / rpy given in `reference`."""
+        t = pose_from_xyz_rpy(xyz, rpy)
+        if reference == "chain":
+            return self._link_pose(origin) @ t
+        base = self._live_pose("base_pose")
+        if reference == "robot":
+            return np.linalg.inv(base) @ self._live_pose("robot_pose") @ t
+        if reference == "scene":
+            return np.linalg.inv(base) @ t
+        raise ValueError(f"unknown reference '{reference}'")
+
+    def from_root(self, t: np.ndarray, reference: str, origin: str):
+        """(xyz, rpy) in `reference` of a 4x4 pose given in the root link's frame."""
+        if reference == "chain":
+            return xyz_rpy_from_pose(np.linalg.inv(self._link_pose(origin)) @ t)
+        base = self._live_pose("base_pose")
+        if reference == "robot":
+            return xyz_rpy_from_pose(np.linalg.inv(self._live_pose("robot_pose")) @ base @ t)
+        if reference == "scene":
+            return xyz_rpy_from_pose(base @ t)
+        raise ValueError(f"unknown reference '{reference}'")
+
+    def convert(self, xyz, rpy, src: str, dst: str, origin: str):
+        """A pose given in reference `src`, expressed in `dst` (chain references use the chain origin `origin`)."""
+        return self.from_root(self.to_root(xyz, rpy, src, origin), dst, origin)
+
+    def scene_targets(self) -> Dict[str, Dict[str, Any]]:
+        """Targets the robot's scene reported: id → {"name", "path", "parent", "pose_in_root", …}."""
+        return {t["id"]: t for t in self.live.get("targets", []) if t.get("id")}
+
+    def targets_list(self) -> List[Tuple[str, str]]:
+        """(id, display name) of every target: the scene's (Unity) or the frames stored here."""
+        if self.uses_scene_targets:
+            out = []
+            for tid, t in self.scene_targets().items():
+                path = t.get("path") or t.get("name") or tid
+                out.append((tid, path[len("Targets/"):] if path.startswith("Targets/") else path))
+            return sorted(out, key=lambda x: x[1].lower())
+        return [(f"frame:{name}", name) for name in sorted(self.frames())]
+
+    def target_pose(self, target_id: str, reference: str, origin: str):
+        """(xyz, rpy) of a target in `reference`."""
+        if target_id.startswith("frame:"):
+            xyz, rpy = self.frame_in(target_id[len("frame:"):], origin)
+            return self.convert(xyz, rpy, "chain", reference, origin)
+        t = self.scene_targets().get(target_id)
+        if t is None:
+            raise KeyError(f"no target '{target_id}'")
+        root = pose_from_xyz_rpy(*pose_to_xyz_rpy(t["pose_in_root"]))
+        return self.from_root(root, reference, origin)
+
+    @staticmethod
+    def _reference_for_robot(reference: str, origin: str) -> str:
+        return f"link:{origin}" if reference == "chain" else reference
+
+    async def create_target(self, name: str, reference: str, xyz, rpy, origin: str,
+                            parent: Optional[str] = None) -> str:
+        """New target `name` at a pose given in `reference`. Scene-owned (Unity: under "Targets", or `parent`, a
+        scene object path) when the robot supports it, else a frame stored here. Returns the target id."""
+        if self.uses_scene_targets:
+            req: Dict[str, Any] = {"op": "create", "name": name, "pose": _pose(xyz, rpy),
+                                   "reference": self._reference_for_robot(reference, origin)}
+            if parent:
+                req["parent"] = parent
+            await self.robot.target(req)  # type: ignore[union-attr]
+            path = f"{parent or 'Targets'}/{name}"
+            return f"target:{path}"
+        cxyz, crpy = self.convert(xyz, rpy, reference, "chain", origin)
+        self.save_frame(name, origin, cxyz, crpy)
+        return f"frame:{name}"
+
+    async def update_target(self, target_id: str, reference: str, xyz, rpy, origin: str) -> None:
+        if target_id.startswith("frame:"):
+            name = target_id[len("frame:"):]
+            cxyz, crpy = self.convert(xyz, rpy, reference, "chain", origin)
+            self.save_frame(name, origin, cxyz, crpy)
+            return
+        await self.robot.target({"op": "update", "id": target_id, "pose": _pose(xyz, rpy),  # type: ignore[union-attr]
+                                 "reference": self._reference_for_robot(reference, origin)})
+
+    async def delete_target(self, target_id: str) -> None:
+        if target_id.startswith("frame:"):
+            self.delete_frame(target_id[len("frame:"):])
+            return
+        await self.robot.target({"op": "delete", "id": target_id})  # type: ignore[union-attr]
+
+    async def select_target_in_viewer(self, target_id: str) -> None:
+        if self.uses_scene_targets and target_id.startswith("target:"):
+            await self.robot.target({"op": "select", "id": target_id})  # type: ignore[union-attr]
+
+    async def set_attach_new_targets(self, attach: bool) -> None:
+        if self.uses_scene_targets:
+            await self.robot.target({"op": "settings", "attach": bool(attach)})  # type: ignore[union-attr]
+
+    CLICK_ORIENTATIONS = ("approach", "surface", "tcp")
+
+    async def set_click_orientation(self, mode: str) -> None:
+        """Orientation of targets the user creates by Ctrl+click: approach (z into the surface, x towards the
+        robot), surface (z out of the surface) or tcp (the TCP's current orientation)."""
+        if mode not in self.CLICK_ORIENTATIONS:
+            raise ValueError(f"unknown click orientation '{mode}'")
+        if self.uses_scene_targets:
+            await self.robot.target({"op": "settings", "orientation": mode})  # type: ignore[union-attr]
+
+    def suggest_target_name(self, prefix: str) -> str:
+        """'<prefix>_<n>' with the lowest n not used by a target: "L_claw_1", "target_3"."""
+        base = "".join(c if c.isalnum() or c in "-_" else "_" for c in (prefix or "").strip())
+        while "__" in base:
+            base = base.replace("__", "_")
+        base = base.strip("_") or "target"
+        names = {name.split("/")[-1] for _, name in self.targets_list()}
+        n = 1
+        while f"{base}_{n}" in names:
+            n += 1
+        return f"{base}_{n}"
+
+    # markers in the robot's viewer (Unity …)
+
+    @property
+    def can_visualize(self) -> bool:
+        return self.robot is not None and bool(self.robot.supports.get("visualize"))
+
+    def marker_items(self, tool: str, base: Optional[str], selected: Optional[str] = None,
+                     target=None, chain_name: Optional[str] = None,
+                     focus: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Chain line, TCP frame, the saved frames (selectable) and an unsaved target, as `visualize` items."""
+        tree = self._tree()
+        base = base or tree.get("root")
+        tcp_xyz, tcp_rpy = self.tcp_for(tool, chain_name)
+        key = chain_name or tool
+        tcp_id = f"tcp:{key}"
+        items: List[Dict[str, Any]] = [
+            {"id": tcp_id, "kind": "frame", "parent": tool, "pose": _pose(tcp_xyz, tcp_rpy),
+             "name": object_name("TCP", key), "label": f"TCP {key}", "style": "tcp", "size": 0.08,
+             "selectable": False, "editable": True},
+            {"id": f"chain:{key}", "kind": "chain", "links": self.chain_links(tool, base), "end": tcp_id,
+             "name": object_name("Chain", key), "label": chain_name or f"{base} → {tool}", "style": "chain"},
+            {"id": f"origin:{base}", "kind": "frame", "parent": base, "pose": _pose((0, 0, 0), (0, 0, 0)),
+             "name": object_name("Origin", base), "label": f"origin {base}", "style": "frame", "size": 0.12,
+             "selectable": False},
+        ]
+        for name, f in ([] if self.uses_scene_targets else sorted(self.frames().items())):
+            items.append({"id": f"frame:{name}", "kind": "frame", "parent": f["parent"],
+                          "pose": _pose(f["xyz"], f["rpy"]), "name": object_name("Frame", name), "label": name,
+                          "style": "target" if selected == name else "frame", "selectable": True,
+                          "editable": True, "selected": selected == name})
+        if target is not None and selected is None:
+            xyz, rpy = target
+            items.append({"id": "target", "kind": "frame", "parent": base, "pose": _pose(xyz, rpy),
+                          "name": "Target", "label": "target", "style": "target", "selectable": False,
+                          "selected": True})
+        for item in items:
+            if item["id"] == focus:
+                item["focus"] = True     # the viewer selects it for editing (Unity: Scene view, Move tool)
+        return items
+
+    # edits made in the viewer (the user dragged a TCP / frame)
+
+    def apply_edit(self, payload: Mapping[str, Any], tool: str, chain_name: Optional[str]) -> Optional[str]:
+        """Store a pose the user set in the viewer. Returns what changed ("tcp" / "frame:<name>") or None."""
+        item_id = str(payload.get("id") or "")
+        pose = payload.get("pose") or {}
+        xyz, rpy = pose_to_xyz_rpy(pose)
+        if item_id == f"tcp:{chain_name or tool}":
+            if chain_name and chain_name in self.chains():
+                self.set_chain_tcp(chain_name, xyz, rpy)
+            else:
+                self.set_tcp(tool, xyz, rpy)
+            return "tcp"
+        if item_id.startswith("frame:"):
+            name = item_id[len("frame:"):]
+            f = self.frames().get(name)
+            if f is None:
+                return None
+            parent = payload.get("parent") or f["parent"]
+            self.save_frame(name, parent, xyz, rpy)
+            return item_id
+        return None
+
+    async def show_markers(self, tool: str, base: Optional[str], selected: Optional[str] = None,
+                           target=None, chain_name: Optional[str] = None, focus: Optional[str] = None) -> bool:
+        """Send the markers to the robot's viewer; False if the robot has none. `focus`: item to select for editing."""
+        if not self.can_visualize or not tool:
+            return False
+        items = self.marker_items(tool, base, selected, target, chain_name, focus)
+        await self.robot.visualize(items)  # type: ignore[union-attr]
+        return True
+
+    async def clear_markers(self) -> None:
+        if self.can_visualize:
+            await self.robot.visualize([])  # type: ignore[union-attr]
+
+
+def object_name(kind: str, name: str) -> str:
+    """Name for a marker object in the viewer's scene: "TCP_right_arm", "Frame_pick"."""
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(name).strip())
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return f"{kind}_{slug.strip('_') or 'unnamed'}"
+
+
+def pose_to_xyz_rpy(pose: Mapping[str, Any]):
+    """(xyz, rpy) from {"position", "orientation" (ROS quaternion x y z w)}."""
+    x, y, z, w = pose.get("orientation") or (0.0, 0.0, 0.0, 1.0)
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    rot = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                    [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                    [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+    t = np.eye(4)
+    t[:3, :3] = rot
+    t[:3, 3] = pose.get("position") or (0.0, 0.0, 0.0)
+    return xyz_rpy_from_pose(t)
+
+
+def _pose(xyz, rpy) -> Dict[str, List[float]]:
+    """{"position", "orientation"} (ROS quaternion) from xyz + URDF rpy."""
+    r = rpy_matrix(*rpy)
+    w = math.sqrt(max(0.0, 1 + r[0, 0] + r[1, 1] + r[2, 2])) / 2
+    if w > 1e-6:
+        q = [(r[2, 1] - r[1, 2]) / (4 * w), (r[0, 2] - r[2, 0]) / (4 * w), (r[1, 0] - r[0, 1]) / (4 * w), w]
+    else:   # 180° rotation: use the largest diagonal element
+        i = int(np.argmax(np.diag(r)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        v = math.sqrt(max(0.0, 1 + r[i, i] - r[j, j] - r[k, k])) / 2
+        q = [0.0, 0.0, 0.0, (r[k, j] - r[j, k]) / (4 * v)]
+        q[i] = v
+        q[j] = (r[j, i] + r[i, j]) / (4 * v)
+        q[k] = (r[k, i] + r[i, k]) / (4 * v)
+    return {"position": [float(v) for v in xyz], "orientation": [float(v) for v in q]}

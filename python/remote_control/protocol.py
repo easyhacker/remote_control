@@ -25,6 +25,8 @@ class MsgType:
     STATE = "state"
     ACK = "ack"
     DESCRIPTION = "description"
+    SELECTED = "selected"
+    EDITED = "edited"
     # controller → robot
     WELCOME = "welcome"
     EXECUTE = "execute"
@@ -33,11 +35,14 @@ class MsgType:
     CANCEL = "cancel"
     STOP = "stop"
     DESCRIBE = "describe"
+    VISUALIZE = "visualize"
+    TARGET = "target"
     # both
     HEARTBEAT = "heartbeat"
 
 
-CONTROL_TYPES = frozenset({MsgType.PAUSE, MsgType.RESUME, MsgType.CANCEL, MsgType.STOP})
+CONTROL_TYPES = frozenset({MsgType.PAUSE, MsgType.RESUME, MsgType.CANCEL, MsgType.STOP, MsgType.VISUALIZE,
+                           MsgType.TARGET})
 
 
 class Channel(Enum):
@@ -54,6 +59,8 @@ _CHANNEL_OF = {
     MsgType.STOP: Channel.CONTROL,
     MsgType.WELCOME: Channel.CONTROL,
     MsgType.DESCRIBE: Channel.CONTROL,
+    MsgType.VISUALIZE: Channel.CONTROL,
+    MsgType.TARGET: Channel.CONTROL,
 }
 
 

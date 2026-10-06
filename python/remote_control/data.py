@@ -7,6 +7,7 @@ Controller-side data files, one directory per robot:
         chains.json         named chains: {"chains": {"<name>": {"origin", "end", "tcp": {"xyz", "rpy"}, "saved_at"}}}
         tcp.json            TCPs of unsaved chains, per end link: {"tcp": {"<link>": {"xyz": [..], "rpy": [..]}}}
         frames.json         named frames: {"frames": {"<name>": {"parent": "<link>", "xyz": [..], "rpy": [..]}}}
+        groups.json         joint groups: {"groups": {"<name>": {"joints": ["<joint>", …], "saved_at"}}}
 
 `data_dir` comes from the system config (`"data_dir"` in remote_control.json; a relative path is relative to
 the config file's directory). project / stage / robot are the names the robot reports (Unity: project folder,
@@ -133,15 +134,44 @@ class RobotStore:
                                + (f" (saved: {', '.join(sorted(poses))})" if poses else " (none saved)"))
         return poses[name]
 
-    def save_pose(self, name: str, joint_names: Sequence[str], positions: Sequence[float]) -> Path:
+    def save_pose(self, name: str, joint_names: Sequence[str], positions: Sequence[float],
+                  group: Optional[str] = None) -> Path:
+        """Save pose `name`; `group` names the joint group it belongs to (its joints are then only that group's)."""
         if not name or not name.strip():
             raise ValueError("pose name must not be empty")
         if len(joint_names) != len(positions):
             raise ValueError("joint_names and positions differ in length")
         poses = self._load_poses()
-        poses[name.strip()] = {"positions": {n: float(x) for n, x in zip(joint_names, positions)},
-                               "saved_at": _now()}
+        entry: Dict[str, Any] = {"positions": {n: float(x) for n, x in zip(joint_names, positions)},
+                                 "saved_at": _now()}
+        if group:
+            entry["group"] = group
+        poses[name.strip()] = entry
         return self._save_poses(poses)
+
+    # ── joint groups ─────────────────────────────────────────────────────────
+
+    GROUPS = "groups.json"
+
+    def groups(self) -> Dict[str, List[str]]:
+        return {n: list(g.get("joints", [])) for n, g in self.load_doc(self.GROUPS).get("groups", {}).items()}
+
+    def save_group(self, name: str, joints: Sequence[str]) -> Path:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("group name must not be empty")
+        if not joints:
+            raise ValueError("a group needs at least one joint")
+        doc = self.load_doc(self.GROUPS).get("groups", {})
+        doc[name] = {"joints": list(joints), "saved_at": _now()}
+        return self.save_doc(self.GROUPS, {"groups": dict(sorted(doc.items()))})
+
+    def delete_group(self, name: str) -> None:
+        doc = self.load_doc(self.GROUPS).get("groups", {})
+        if name not in doc:
+            raise KeyError(f"no group '{name}'")
+        del doc[name]
+        self.save_doc(self.GROUPS, {"groups": dict(sorted(doc.items()))})
 
     def delete_pose(self, name: str) -> None:
         poses = self._load_poses()

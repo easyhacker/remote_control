@@ -53,7 +53,7 @@ Sent right after connecting. It is sent again every `max(1 s, heartbeat_timeout)
 { "protocol": 1, "name": "Demo arm", "software": "remote-control-unity/0.1",
   "joints": [ { "name": "shoulder", "type": "revolute", "lower": -3.14, "upper": 3.14, "max_velocity": 2.0 } ],
   "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false,
-                "describe": true, "visualize": true },
+                "describe": true, "visualize": true, "parallel_goals": true },
   "instance": "4f1c0a9e2b7d",
   "project": "My project", "stage": "robot0625",
   "state": { "...": "same as the state message" } }
@@ -99,8 +99,13 @@ Sent exactly once per accepted goal.
 Sent on every state change, and inside `hello`.
 ```json
 { "state": "executing", "goal_id": "3f2c9a", "queued": ["a1b2c3"], "pause_reason": null,
+  "active": ["3f2c9a", "77e0d1"],
+  "goals": { "3f2c9a": { "state": "executing", "joints": ["shoulder"], "pause_reason": null },
+             "77e0d1": { "state": "paused", "joints": ["gripper"], "pause_reason": "requested" } },
   "positions": { "shoulder": 0.1, "elbow": 0.4 } }
 ```
+With parallel goals (`supports.parallel_goals`), several goals can run at once: `active` lists them and `goals` gives
+each one's state and joints. `goal_id`, `state` and `pause_reason` describe the first active goal, as before.
 `positions` covers all of the robot's joints, keyed by name. The `positions` arrays in other messages follow the goal's `joint_names` order.
 `state` is `idle`, `executing`, `pausing`, `paused`, `resuming` or `stopping`.
 
@@ -183,6 +188,10 @@ reconnects and sends `hello` under it (see [Robot ids](#robot-ids)).
   - `queue` (default): run after the active goal and any queued ones.
   - `replace`: slow the active goal to a halt (it ends `canceled`), drop the queue, then run this goal.
   - `reject`: reject this goal.
+  - `parallel` (if `supports.parallel_goals`): run now, alongside the active goals, unless one of them moves any of
+    this goal's joints; then wait for those goals only. Use it to move joint groups independently, e.g. close a gripper
+    while the arm moves. A `queue` goal still waits until the robot is idle. `pause` / `resume` / `cancel` act on one
+    goal; `stop` ends all of them.
 - `interpolation`: `cubic` (default; smooth, zero velocity at the start and end) or `linear`.
 
 The motion starts at the robot's position when the goal begins and reaches `points[0]` at `points[0].time_from_start`.

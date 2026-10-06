@@ -9,13 +9,17 @@ and reports through the `emit(type, goal_id, payload)` callback.
 Interruptions never stop instantly: pause/cancel/stop ramp the goal's time scale (rate) from 1 to 0
 over `decel_time`, so the motion slows along its planned path; resume ramps it back up.
 
+Several goals can run at once when they move different joints (on_busy="parallel", e.g. the left arm and the
+right arm of a dual-arm robot); each one is paused / resumed / cancelled on its own, and stop ends them all.
+on_busy="queue" goals wait until the robot is idle, as before.
+
 The C# port (unity/.../Runtime/Core/MotionExecutor.cs) mirrors this file — keep them in step.
 """
 from __future__ import annotations
 
 import abc
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from .protocol import Envelope, GoalStatus, MsgType, RobotState
 from .trajectory import GoalError, GoalSpec, Joint, Trajectory, check_segment_speed, parse_goal
@@ -61,6 +65,7 @@ class _Goal:
     def __init__(self, goal_id: str, spec: GoalSpec) -> None:
         self.id = goal_id
         self.spec = spec
+        self.joint_set: Set[str] = set(spec.joint_names)
         self.traj: Optional[Trajectory] = None
         self.time = 0.0
         self.rate = 1.0
@@ -72,6 +77,18 @@ class _Goal:
         self.since_feedback = 0.0
         self.last_commanded: List[float] = []
 
+    @property
+    def parallel(self) -> bool:
+        return self.spec.on_busy == "parallel"
+
+    @property
+    def state(self) -> str:
+        if self.end_status:
+            return RobotState.STOPPING
+        if self.target_rate == 0:
+            return RobotState.PAUSED if self.rate == 0 else RobotState.PAUSING
+        return RobotState.EXECUTING if self.rate == 1 else RobotState.RESUMING
+
 
 class MotionExecutor:
     def __init__(self, driver: JointDriver, emit: Emit, decel_time: float = 0.4) -> None:
@@ -79,31 +96,44 @@ class MotionExecutor:
         self.emit = emit
         self.decel_time = max(decel_time, 1e-3)
         self.joints: Dict[str, Joint] = {j.name: j for j in driver.joints()}
-        self.active: Optional[_Goal] = None
+        self.actives: List[_Goal] = []          # running goals (disjoint joint sets)
         self.queue: Deque[_Goal] = deque()
         self._known_ids: set = set()
         self._last_state: Optional[Dict[str, Any]] = None
+
+    @property
+    def active(self) -> Optional[_Goal]:
+        """The first running goal (older single-goal API)."""
+        return self.actives[0] if self.actives else None
+
+    def _find_active(self, goal_id: Optional[str]) -> Optional[_Goal]:
+        return next((g for g in self.actives if g.id == goal_id), None)
 
     # ── state ────────────────────────────────────────────────────────────────
 
     @property
     def state(self) -> str:
-        g = self.active
-        if g is None:
+        """Robot state: idle, or the 'busiest' state of the running goals."""
+        if not self.actives:
             return RobotState.IDLE
-        if g.end_status:
-            return RobotState.STOPPING
-        if g.target_rate == 0:
-            return RobotState.PAUSED if g.rate == 0 else RobotState.PAUSING
-        return RobotState.EXECUTING if g.rate == 1 else RobotState.RESUMING
+        states = {g.state for g in self.actives}
+        for s in (RobotState.EXECUTING, RobotState.RESUMING, RobotState.PAUSING, RobotState.STOPPING):
+            if s in states:
+                return s
+        return RobotState.PAUSED
 
     def state_payload(self) -> Dict[str, Any]:
         pos = self.driver.read_positions()
+        first = self.active
+        paused = next((g for g in self.actives if g.pause_reason), None)
         return {
             "state": self.state,
-            "goal_id": self.active.id if self.active else None,
+            "goal_id": first.id if first else None,
+            "active": [g.id for g in self.actives],
+            "goals": {g.id: {"state": g.state, "joints": list(g.spec.joint_names), "pause_reason": g.pause_reason}
+                      for g in self.actives},
             "queued": [g.id for g in self.queue],
-            "pause_reason": self.active.pause_reason if self.active else None,
+            "pause_reason": paused.pause_reason if paused else None,
             "positions": {n: pos.get(n) for n in self.joints},
         }
 
@@ -147,7 +177,7 @@ class MotionExecutor:
         except GoalError as exc:
             self.emit(MsgType.REJECTED, goal_id, {"reason": str(exc)})
             return
-        busy = self.active is not None or bool(self.queue)
+        busy = bool(self.actives) or bool(self.queue)
         if busy and spec.on_busy == "reject":
             self.emit(MsgType.REJECTED, goal_id, {"reason": "robot is busy"})
             return
@@ -155,21 +185,27 @@ class MotionExecutor:
             for q in list(self.queue):
                 self._finish(q, GoalStatus.CANCELED, "replaced by a new goal")
             self.queue.clear()
-            if self.active and not self.active.end_status:
-                self._begin_end(self.active, GoalStatus.CANCELED, "replaced by a new goal")
+            for g in self.actives:
+                if not g.end_status:
+                    self._begin_end(g, GoalStatus.CANCELED, "replaced by a new goal")
         goal = _Goal(goal_id, spec)
         self._known_ids.add(goal_id)
         self.queue.append(goal)
-        position = len(self.queue) - (0 if self.active else 1)
+        self._start_ready()
+        if goal in self.actives:
+            position = 0
+        else:   # goals that still have to finish before this one can start
+            ahead = [g for g in self.actives if not goal.parallel or g.joint_set & goal.joint_set]
+            ahead += [q for q in self.queue if q is not goal and self.queue.index(q) < self.queue.index(goal)
+                      and (not goal.parallel or q.joint_set & goal.joint_set)]
+            position = max(1, len(ahead))
         self.emit(MsgType.ACCEPTED, goal_id, {"queue_position": position})
-        if self.active is None:
-            self._start_next()
 
     # ── control (also used locally, e.g. by the heartbeat watchdog) ──────────
 
     def pause(self, goal_id: Optional[str], reason: str = "requested"):
-        g = self.active
-        if g is None or g.id != goal_id:
+        g = self._find_active(goal_id)
+        if g is None:
             if any(q.id == goal_id for q in self.queue):
                 return False, "goal is queued, not running"
             return False, "no such goal"
@@ -182,8 +218,8 @@ class MotionExecutor:
         return True, ""
 
     def resume(self, goal_id: Optional[str]):
-        g = self.active
-        if g is None or g.id != goal_id:
+        g = self._find_active(goal_id)
+        if g is None:
             return False, "no such goal"
         if g.end_status:
             return False, "goal is ending"
@@ -199,8 +235,8 @@ class MotionExecutor:
                 self.queue.remove(q)
                 self._finish(q, GoalStatus.CANCELED, "canceled while queued")
                 return True, ""
-        g = self.active
-        if g is None or g.id != goal_id:
+        g = self._find_active(goal_id)
+        if g is None:
             return False, "no such goal"
         if g.end_status:
             return True, "already ending"
@@ -211,23 +247,27 @@ class MotionExecutor:
         for q in list(self.queue):
             self._finish(q, GoalStatus.STOPPED, "robot stopped")
         self.queue.clear()
-        if self.active:
-            self._begin_end(self.active, GoalStatus.STOPPED, "robot stopped")
+        for g in self.actives:
+            self._begin_end(g, GoalStatus.STOPPED, "robot stopped")
         return True, ""
 
     def pause_for(self, reason: str) -> None:
-        """Pause whatever is running (e.g. reason='connection_lost')."""
-        if self.active and not self.active.end_status and self.active.target_rate != 0:
-            self.pause(self.active.id, reason)
+        """Pause everything that is running (e.g. reason='connection_lost')."""
+        changed = False
+        for g in self.actives:
+            if not g.end_status and g.target_rate != 0:
+                self.pause(g.id, reason)
+                changed = True
+        if changed:
             self._publish_state()
 
     def abort_all(self, message: str) -> None:
         for q in list(self.queue):
             self._finish(q, GoalStatus.ABORTED, message)
         self.queue.clear()
-        if self.active:
-            self._finish(self.active, GoalStatus.ABORTED, message)
-            self.active = None
+        for g in list(self.actives):
+            self._finish(g, GoalStatus.ABORTED, message)
+        self.actives.clear()
         self._publish_state()
 
     def _begin_end(self, g: _Goal, status: str, message: str) -> None:
@@ -237,31 +277,62 @@ class MotionExecutor:
 
     # ── motion ───────────────────────────────────────────────────────────────
 
-    def _start_next(self) -> None:
-        while self.queue and self.active is None:
-            g = self.queue.popleft()
-            spec = g.spec
-            pos = self.driver.read_positions()
-            start = [pos[n] for n in spec.joint_names]
-            try:
-                check_segment_speed(spec.joint_names, self.joints, start, spec.positions[0],
-                                    spec.times[0], "start→point 0")
-            except GoalError as exc:
-                self._finish(g, GoalStatus.ABORTED, str(exc))
+    def _start_ready(self) -> None:
+        """Start queued goals that may run now, in queue order:
+        a "parallel" goal when none of its joints is used by a running goal or by an earlier queued goal;
+        any other goal only when the robot is idle and nothing queued is ahead of it."""
+        busy: Set[str] = set()
+        for g in self.actives:
+            busy |= g.joint_set
+        for g in list(self.queue):
+            if g.parallel:
+                ok = not (g.joint_set & busy)
+            else:
+                ok = not self.actives and self.queue[0] is g
+            if ok and self._begin(g):
+                self.queue.remove(g)
+                busy |= g.joint_set
                 continue
-            g.traj = Trajectory(start, spec.times, spec.positions, spec.interpolation)
-            g.last_commanded = start
-            self.active = g
+            if ok:            # could not start (aborted while checking): it left the queue
+                continue
+            if not g.parallel:
+                break         # a sequential goal waits for idle; everything behind it waits too
+            busy |= g.joint_set
         self._publish_state()
 
-    def tick(self, dt: float) -> None:
-        if self.active is None:
-            if self.queue:
-                self._start_next()
-            return
-        g = self.active
-        assert g.traj is not None
+    def _begin(self, g: _Goal) -> bool:
+        spec = g.spec
+        pos = self.driver.read_positions()
+        start = [pos[n] for n in spec.joint_names]
+        try:
+            check_segment_speed(spec.joint_names, self.joints, start, spec.positions[0],
+                                spec.times[0], "start→point 0")
+        except GoalError as exc:
+            self.queue.remove(g)
+            self._finish(g, GoalStatus.ABORTED, str(exc))
+            return False
+        g.traj = Trajectory(start, spec.times, spec.positions, spec.interpolation)
+        g.last_commanded = start
+        self.actives.append(g)
+        return True
 
+    def tick(self, dt: float) -> None:
+        if not self.actives:
+            if self.queue:
+                self._start_ready()
+            return
+        finished = False
+        for g in list(self.actives):
+            if self._tick_goal(g, dt):
+                self.actives.remove(g)
+                finished = True
+        if finished or self.queue:
+            self._start_ready()
+        self._publish_state()
+
+    def _tick_goal(self, g: _Goal, dt: float) -> bool:
+        """Advance one goal; True when it has ended."""
+        assert g.traj is not None
         # Ramp the time scale towards its target, integrating time with the mean rate
         step = dt / self.decel_time
         r0 = g.rate
@@ -291,13 +362,11 @@ class MotionExecutor:
 
         if g.time >= g.traj.duration:
             self._finish(g, GoalStatus.SUCCEEDED, "")
-            self.active = None
-            self._start_next()
-        elif g.end_status and g.rate == 0:
+            return True
+        if g.end_status and g.rate == 0:
             self._finish(g, g.end_status, g.end_message)
-            self.active = None
-            self._start_next()
-        self._publish_state()
+            return True
+        return False
 
     def _measured(self, g: _Goal) -> List[float]:
         pos = self.driver.read_positions()
@@ -313,7 +382,7 @@ class MotionExecutor:
     def _feedback(self, g: _Goal) -> None:
         assert g.traj is not None
         self.emit(MsgType.FEEDBACK, g.id, {
-            "state": self.state, "point_index": min(g.next_point, len(g.spec.times) - 1),
+            "state": g.state, "point_index": min(g.next_point, len(g.spec.times) - 1),
             "time": round(g.time, 4), "duration": g.traj.duration, "rate": round(g.rate, 4),
             "positions": self._measured(g),
         })

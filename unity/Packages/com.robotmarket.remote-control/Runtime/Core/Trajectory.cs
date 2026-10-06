@@ -50,7 +50,7 @@ namespace RobotMarket.RemoteControl
     {
         public const double SpeedPeakFactor = 1.5;
         static readonly string[] ReportModes = { "none", "points", "progress", "all" };
-        static readonly string[] OnBusyModes = { "queue", "replace", "reject" };
+        static readonly string[] OnBusyModes = { "queue", "replace", "reject", "parallel" };
         static readonly string[] Interpolations = { "cubic", "linear" };
 
         static string F(double x) => x.ToString("0.######", CultureInfo.InvariantCulture);

@@ -59,6 +59,7 @@ class Backend:
         self.live: Dict[str, Any] = {}    # latest describe(tree=False): base / robot pose, scene targets
         self.goal: Optional[GoalHandle] = None          # last goal sent from the toolbox
         self._jog_targets: Dict[str, float] = {}
+        self.goals: Dict[str, Tuple[GoalHandle, set]] = {}   # goals sent from here that are still running
         self._listening: set = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._thread: Optional[threading.Thread] = None
@@ -233,16 +234,26 @@ class Backend:
         return next(j for j in self.robot.joints if j.name == name)
 
     # ── motion ───────────────────────────────────────────────────────────────
+    #
+    # Every goal the toolbox sends runs in parallel with goals on other joints when the robot supports it
+    # (on_busy="parallel"): the left arm can move while the right arm does something else. Goals on the same
+    # joints still run in order.
 
     def _require_robot(self) -> RobotHandle:
         if self.robot is None or not self.robot.online:
             raise RuntimeError("no robot connected")
         return self.robot
 
-    def _watch(self, goal: GoalHandle, what: str) -> GoalHandle:
+    @property
+    def _on_busy(self) -> str:
+        return self._require_robot().parallel_on_busy
+
+    def _watch(self, goal: GoalHandle, what: str, joints) -> GoalHandle:
         self.goal = goal
+        self.goals[goal.goal_id] = (goal, set(joints))
 
         def on_result(p: Dict[str, Any]) -> None:
+            self.goals.pop(goal.goal_id, None)
             status = p.get("status")
             msg = p.get("message") or ""
             if what.startswith("jog") and status == "canceled":
@@ -250,10 +261,16 @@ class Backend:
             else:
                 self.log(f"{what}: {status}" + (f" ({msg})" if msg and msg != status else ""))
             if status != "succeeded":
-                self._jog_targets.clear()
+                for j in joints:
+                    self._jog_targets.pop(j, None)
 
         goal.on("result", on_result)
         return goal
+
+    def running_goals(self, joints=None) -> List[GoalHandle]:
+        """Goals sent from here that have not ended; only those touching `joints` if given."""
+        return [g for g, js in list(self.goals.values())
+                if not g.done and (joints is None or js & set(joints))]
 
     @staticmethod
     def _clamp(joint: Any, x: float) -> float:
@@ -270,24 +287,25 @@ class Backend:
         return max(minimum, 1.5 * abs(distance) / (vmax * max(0.01, speed)) * 1.1)
 
     async def jog_step(self, name: str, delta: float, speed: float = 0.5) -> float:
-        """Move one joint by delta (rad / m) from its last jog target (queued, so quick clicks add up)."""
+        """Move one joint by delta (rad / m) from its last jog target (quick clicks add up)."""
         robot = self._require_robot()
         j = self.joint(name)
-        active = self.goal is not None and not self.goal.done
-        base = self._jog_targets.get(name) if active else None
+        base = self._jog_targets.get(name) if self.running_goals([name]) else None
         if base is None:
             base = (await robot.current_positions()).get(name, 0.0)
         target = self._clamp(j, base + delta)
         self._jog_targets[name] = target
         goal = await robot.execute([name], [([target], round(self._duration(j, target - base, speed), 3))],
-                                   report="none", on_busy="queue")
-        self._watch(goal, f"jog {name} → {target:.3f}")
+                                   report="none", on_busy=self._on_busy)
+        self._watch(goal, f"jog {name} → {target:.3f}", [name])
         return target
 
     async def jog_start(self, name: str, direction: int, speed: float = 0.5) -> None:
         """Continuous jog: one goal towards the joint limit at jog speed; jog_stop() ramps it down."""
         robot = self._require_robot()
         j = self.joint(name)
+        for g in self.running_goals([name]):      # this joint only; other joints keep moving
+            await g.cancel()
         now = (await robot.current_positions()).get(name, 0.0)
         far = (j.upper if direction > 0 else j.lower)
         if far is None:
@@ -296,15 +314,17 @@ class Backend:
         if abs(target - now) < 1e-6:
             self.log(f"{name} is at its {'upper' if direction > 0 else 'lower'} limit")
             return
-        self._jog_targets.clear()
+        self._jog_targets.pop(name, None)
         goal = await robot.execute([name], [([target], round(self._duration(j, target - now, speed), 3))],
-                                   report="none", on_busy="replace")
-        self._watch(goal, f"jog {name}")
+                                   report="none", on_busy=self._on_busy)
+        self._continuous = goal
+        self._watch(goal, f"jog {name}", [name])
 
     async def jog_stop(self) -> None:
-        if self.goal is not None and not self.goal.done:
-            await self.goal.cancel()
-        self._jog_targets.clear()
+        goal = getattr(self, "_continuous", None)
+        if goal is not None and not goal.done:
+            await goal.cancel()
+        self._continuous = None
 
     async def move_joints(self, positions: Mapping[str, float], duration: Optional[float] = None,
                           speed: float = 0.5, label: str = "move") -> GoalHandle:
@@ -314,28 +334,80 @@ class Backend:
             now = await robot.current_positions()
             duration = max([self._duration(self.joint(n), x - now.get(n, x), speed, 1.0)
                             for n, x in positions.items()] or [1.0])
-        self._jog_targets.clear()
-        goal = await robot.move_to(dict(positions), duration=round(duration, 3), report="points")
-        return self._watch(goal, label)
+        for n in positions:
+            self._jog_targets.pop(n, None)
+        goal = await robot.move_to(dict(positions), duration=round(duration, 3), report="points",
+                                   on_busy=self._on_busy)
+        return self._watch(goal, label, positions)
 
-    async def pause(self) -> Dict[str, Any]:
-        if self.goal is None:
-            raise RuntimeError("no goal to pause")
-        return await self.goal.pause()
+    async def _each(self, goals: List[GoalHandle], op: str) -> Dict[str, Any]:
+        if not goals:
+            raise RuntimeError("nothing is moving")
+        acks = [await getattr(g, op)() for g in goals]
+        failed = [a.get("message") for a in acks if not a.get("ok")]
+        return {"ok": not failed, "message": "; ".join(m for m in failed if m) or f"{len(goals)} goal(s)"}
 
-    async def resume(self) -> Dict[str, Any]:
-        if self.goal is None:
-            raise RuntimeError("no goal to resume")
-        return await self.goal.resume()
+    async def pause(self, joints=None) -> Dict[str, Any]:
+        """Pause the running goals (only those moving `joints`, if given)."""
+        return await self._each(self.running_goals(joints), "pause")
 
-    async def cancel(self) -> Dict[str, Any]:
-        if self.goal is None:
-            raise RuntimeError("no goal to cancel")
-        return await self.goal.cancel()
+    async def resume(self, joints=None) -> Dict[str, Any]:
+        return await self._each(self.running_goals(joints), "resume")
+
+    async def cancel(self, joints=None) -> Dict[str, Any]:
+        return await self._each(self.running_goals(joints), "cancel")
 
     async def stop_all(self) -> Dict[str, Any]:
         self._jog_targets.clear()
         return await self._require_robot().stop()
+
+    # ── joint groups ─────────────────────────────────────────────────────────
+
+    def groups(self) -> List[Dict[str, Any]]:
+        """Joint groups: the saved ones, then suggestions (saved chains' joints, 'L' / 'R' name prefixes and their
+        grippers) under names not used yet. Each: {"name", "joints", "builtin"}."""
+        robot = self.robot
+        if robot is None:
+            return []
+        names = robot.joint_names
+        out: List[Dict[str, Any]] = []
+        saved = robot.joint_groups() if self.data_dir is not None else {}
+        for n, js in saved.items():
+            out.append({"name": n, "joints": [j for j in js if j in names], "builtin": False})
+        taken = set(saved)
+
+        def suggest(name: str, joints: List[str]) -> None:
+            if name not in taken and joints and len(joints) < len(names):
+                taken.add(name)
+                out.append({"name": name, "joints": joints, "builtin": True})
+
+        prefixes = sorted({n.split("_")[0] for n in names if "_" in n and len(n.split("_")[0]) <= 3})
+        for pre in prefixes:
+            members = [n for n in names if n.startswith(pre + "_")]
+            grip = [n for n in members if any(k in n.lower() for k in ("finger", "grip", "jaw"))]
+            suggest(f"{pre} arm" if grip else pre, [n for n in members if n not in grip] or members)
+            suggest(f"{pre} gripper", grip)
+        try:
+            for cname, c in sorted(self.chains().items()):
+                suggest(cname, self.chain(c["end"], c["origin"], cname).joint_names)
+        except Exception:
+            pass
+        return out
+
+    def group_joints(self, group: Optional[str]) -> Optional[List[str]]:
+        """Joints of a group (None = all joints)."""
+        if not group:
+            return None
+        g = next((g for g in self.groups() if g["name"] == group), None)
+        if g is None:
+            raise KeyError(f"no group '{group}'")
+        return list(g["joints"])
+
+    def save_group(self, name: str, joints) -> Path:
+        return self._require_robot().save_joint_group(name, list(joints))
+
+    def delete_group(self, name: str) -> None:
+        self._require_robot().delete_joint_group(name)
 
     # ── description and poses ───────────────────────────────────────────────
 
@@ -347,10 +419,24 @@ class Backend:
 
     HOME = "home"
 
-    def home_positions(self) -> Dict[str, float]:
-        """The built-in home pose: every joint at 0, or at the limit nearest to 0."""
+    def home_positions(self, group: Optional[str] = None) -> Dict[str, float]:
+        """The built-in home pose: every joint (of `group`) at 0, or at the limit nearest to 0."""
         robot = self._require_robot()
-        return {j.name: self._clamp(j, 0.0) for j in robot.joints}
+        joints = self.group_joints(group)
+        return {j.name: self._clamp(j, 0.0) for j in robot.joints if joints is None or j.name in joints}
+
+    async def go_home(self, group: Optional[str] = None, speed: float = 0.5) -> GoalHandle:
+        """Home a group (built-in zeros, or the joints of a saved pose "home" that belong to the group)."""
+        robot = self._require_robot()
+        joints = self.group_joints(group)
+        if self.has_saved_pose(self.HOME):
+            home = robot.get_pose(self.HOME)
+            positions = {n: x for n, x in home.items() if joints is None or n in joints}
+        else:
+            positions = self.home_positions(group)
+        if not positions:
+            raise RuntimeError(f"the home pose has no joints of group '{group}'")
+        return await self.move_joints(positions, speed=speed, label=f"home {group}" if group else "home")
 
     def has_saved_pose(self, name: str) -> bool:
         robot = self.robot
@@ -367,14 +453,15 @@ class Backend:
             for name in store.list_poses():
                 p = store.get_pose(name)
                 out.append({"name": name, "joints": len(p.get("positions", {})), "saved_at": p.get("saved_at", ""),
-                            "builtin": False})
+                            "group": p.get("group") or "", "builtin": False})
         if not any(p["name"] == self.HOME for p in out):
             out.insert(0, {"name": self.HOME, "joints": len(robot.joints), "saved_at": "built-in: all joints 0",
-                           "builtin": True})
+                           "group": "", "builtin": True})
         return out
 
-    async def save_pose(self, name: str) -> Path:
-        return await self._require_robot().save_pose(name)
+    async def save_pose(self, name: str, group: Optional[str] = None) -> Path:
+        """Save the current positions of all joints, or only of `group`'s joints (a group pose)."""
+        return await self._require_robot().save_pose(name, joints=self.group_joints(group), group=group)
 
     def delete_pose(self, name: str) -> None:
         if name == self.HOME and not self.has_saved_pose(name):
@@ -382,6 +469,7 @@ class Backend:
         self._require_robot().delete_pose(name)
 
     async def go_to_pose(self, name: str, speed: float = 0.5) -> GoalHandle:
+        """Move to a pose; a group pose moves only its group's joints, in parallel with other groups."""
         robot = self._require_robot()
         if name == self.HOME and not self.has_saved_pose(name):
             positions = self.home_positions()

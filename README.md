@@ -105,7 +105,8 @@ The controller keeps files per robot under the config's `data_dir` (`D:\Dev\remo
 
 ```
 <data_dir>/<project>/<stage>/<robot_id>/description.json   names, base location, kinematic tree, joint positions
-<data_dir>/<project>/<stage>/<robot_id>/poses.json         named joint poses
+<data_dir>/<project>/<stage>/<robot_id>/poses.json         named joint poses (a group pose has "group")
+<data_dir>/<project>/<stage>/<robot_id>/groups.json        joint groups
 ```
 
 The robot reports `project` and `stage`. Unity uses the project folder and the scene name; override them under
@@ -119,6 +120,12 @@ convention (x forward, y left, z up, metres), so a Unity robot's tree can be com
 | `go NAME` | `goal = await robot.move_to_pose("NAME")` (timed from the joints' max velocities) |
 | `poses` | `robot.list_poses()` |
 | `del NAME` | `robot.delete_pose("NAME")` |
+| | `robot.save_joint_group("left_gripper", ["L_finger1", "L_finger2"])` / `robot.joint_groups()` |
+| | `await robot.save_pose("close_left_gripper", group="left_gripper")` (only that group's joints) |
+| | `goal = await robot.move_group("left_gripper", {"L_finger1": 0.0, "L_finger2": 0.0}, 1.0)` |
+
+Group moves use `on_busy="parallel"` when the robot supports it, so groups move independently: a gripper can close
+while the arm is still moving. Goals on the same joints run one after the other.
 
 The controller needs the directory: `MotionController(connector, data_dir=data_dir_from_config(config, system_config_path()))`.
 
@@ -126,7 +133,12 @@ The controller needs the directory: `MotionController(connector, data_dir=data_d
 
 A wxPython controller with native widgets on Windows, macOS and Linux:
 - **Joint jog:** click a step, or hold to move continuously; drag a slider to go to a value.
-- **Poses:** save, go to and delete, in the same `poses.json` as `controller_demo.py`.
+- **Joint groups:** the group selector in Joint jog shows one group's joints; *Home*, *Save pose…* and *Stop group*
+  act on that group only. *Groups…* creates and edits groups (saved in `groups.json`). Groups are suggested from saved
+  chains and from `L_` / `R_` style name prefixes (arm and gripper). Every move the Toolbox sends runs in parallel with
+  moves of other joints, so groups move independently. Pause / Resume / Cancel in the toolbar act on all running moves.
+- **Poses:** save, go to and delete, in the same `poses.json` as `controller_demo.py`. A pose saved with a group
+  selected (e.g. `close_left_gripper`) stores only that group's joints and moves only them.
 - **Tool & Targets:** pick the kinematic chain's start (origin) and end link, from the dropdowns or the kinematic tree view,
   and **Save chain…** under a name. Saving creates the chain's TCP (tool centre point), which you then offset and
   *Apply*. Each saved chain keeps its own TCP. The target can be typed in or be a saved **frame**; *From TCP…* saves where the TCP is

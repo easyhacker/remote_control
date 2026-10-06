@@ -376,6 +376,51 @@ class _Conformance:
             with self.assertRaises(PoseNotFound):
                 await self.robot.move_to_pose("ready")
 
+    async def test_parallel_goals_on_different_joints(self):
+        self.assertTrue(self.robot.supports.get("parallel_goals"))
+        t0 = time.monotonic()
+        a = await self.robot.execute(["shoulder"], [([1.0], 0.6)], on_busy="parallel")
+        b = await self.robot.execute(["elbow"], [([0.8], 0.6)], on_busy="parallel")
+        self.assertEqual((a.queue_position, b.queue_position), (0, 0))       # both start at once
+        await asyncio.sleep(0.15)
+        self.assertEqual(sorted(self.robot.state.get("active", [])), sorted([a.goal_id, b.goal_id]))
+        self.assertEqual((await a.result(timeout=3))["status"], "succeeded")
+        self.assertEqual((await b.result(timeout=3))["status"], "succeeded")
+        self.assertLess(time.monotonic() - t0, 1.1)                          # not one after the other
+        await self.wait_state("idle")
+        self.assertAlmostEqual(self.pos("shoulder"), 1.0, places=3)
+        self.assertAlmostEqual(self.pos("elbow"), 0.8, places=3)
+
+    async def test_parallel_goal_on_busy_joints_waits_for_them(self):
+        a = await self.robot.execute(["shoulder", "elbow"], [([1.0, 0.5], 0.5)], on_busy="parallel")
+        b = await self.robot.execute(["elbow"], [([-0.5], 0.4)], on_busy="parallel")
+        c = await self.robot.execute(["slide"], [([0.2], 0.4)], on_busy="parallel")
+        self.assertEqual(a.queue_position, 0)
+        self.assertGreaterEqual(b.queue_position, 1)                         # elbow is busy: waits for a
+        self.assertEqual(c.queue_position, 0)                                # slide is free: runs now
+        self.assertEqual((await b.result(timeout=5))["status"], "succeeded")
+        await self.wait_state("idle")
+        self.assertAlmostEqual(self.pos("elbow"), -0.5, places=3)
+        self.assertAlmostEqual(self.pos("shoulder"), 1.0, places=3)
+        self.assertAlmostEqual(self.pos("slide"), 0.2, places=3)
+
+    async def test_parallel_goals_pause_and_cancel_independently(self):
+        a = await self.robot.execute(["shoulder"], [([2.0], 1.0)], on_busy="parallel", report="all",
+                                     progress_hz=50)
+        b = await self.robot.execute(["elbow"], [([1.0], 0.6)], on_busy="parallel")
+        await asyncio.sleep(0.2)
+        self.assertTrue((await a.pause())["ok"])
+        self.assertEqual((await b.result(timeout=3))["status"], "succeeded")    # b keeps going
+        self.assertLess(self.pos("shoulder"), 2.0)
+        self.assertTrue((await a.cancel())["ok"])
+        self.assertEqual((await a.result(timeout=3))["status"], "canceled")
+        c = await self.robot.execute(["shoulder"], [([0.5], 0.4)], on_busy="parallel")
+        d = await self.robot.execute(["slide"], [([0.3], 0.8)], on_busy="parallel")
+        await asyncio.sleep(0.1)
+        self.assertTrue((await self.robot.stop())["ok"])                       # stop ends everything
+        self.assertEqual((await c.result(timeout=3))["status"], "stopped")
+        self.assertEqual((await d.result(timeout=3))["status"], "stopped")
+
     async def test_execute_reports_each_point_and_succeeds(self):
         goal = await self.robot.execute(["shoulder", "elbow"],
                                         [([0.5, -0.3], 0.3), ([1.0, 0.2], 0.6)], report="all", progress_hz=20)

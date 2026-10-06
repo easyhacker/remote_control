@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 SPEED_PEAK_FACTOR = 1.5  # cubic segments peak at up to ~1.5× the average segment speed
 REPORT_MODES = ("none", "points", "progress", "all")
-ON_BUSY_MODES = ("queue", "replace", "reject")
+ON_BUSY_MODES = ("queue", "replace", "reject", "parallel")
 INTERPOLATIONS = ("cubic", "linear")
 
 

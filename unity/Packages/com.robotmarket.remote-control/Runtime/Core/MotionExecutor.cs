@@ -46,12 +46,18 @@ namespace RobotMarket.RemoteControl
         }
     }
 
+    /// <summary>
+    /// Runs goals. Several goals run at once when they move different joints (on_busy "parallel", e.g. the two arms
+    /// of a dual-arm robot), each paused / resumed / cancelled on its own; stop ends all. "queue" goals wait until
+    /// the robot is idle. Mirrors python/remote_control/executor.py — keep them in step.
+    /// </summary>
     public sealed class MotionExecutor
     {
         sealed class Goal
         {
             public string Id;
             public GoalSpec Spec;
+            public HashSet<string> JointSet;
             public Trajectory Traj;
             public double Time;
             public double Rate = 1;
@@ -61,6 +67,18 @@ namespace RobotMarket.RemoteControl
             public string PauseReason;
             public int NextPoint;
             public double SinceFeedback;
+
+            public bool Parallel => Spec.OnBusy == "parallel";
+
+            public string State
+            {
+                get
+                {
+                    if (EndStatus != null) return RobotState.Stopping;
+                    if (TargetRate == 0) return Rate == 0 ? RobotState.Paused : RobotState.Pausing;
+                    return Rate == 1 ? RobotState.Executing : RobotState.Resuming;
+                }
+            }
         }
 
         public delegate void EmitFn(string type, string goalId, JObject payload);
@@ -68,9 +86,9 @@ namespace RobotMarket.RemoteControl
         readonly IJointDriver _driver;
         readonly EmitFn _emit;
         readonly Dictionary<string, Joint> _joints;
-        readonly LinkedList<Goal> _queue = new LinkedList<Goal>();
+        readonly List<Goal> _queue = new List<Goal>();
+        readonly List<Goal> _actives = new List<Goal>();
         readonly HashSet<string> _knownIds = new HashSet<string>();
-        Goal _active;
         string _lastStateKey;
 
         public double DecelTime { get; }
@@ -84,22 +102,26 @@ namespace RobotMarket.RemoteControl
             _joints = driver.Joints.ToDictionary(j => j.Name);
         }
 
+        Goal FindActive(string goalId) => _actives.FirstOrDefault(g => g.Id == goalId);
+
         // ── state ────────────────────────────────────────────────────────────
 
+        /// <summary>Idle, or the "busiest" state of the running goals.</summary>
         public string State
         {
             get
             {
-                var g = _active;
-                if (g == null) return RobotState.Idle;
-                if (g.EndStatus != null) return RobotState.Stopping;
-                if (g.TargetRate == 0) return g.Rate == 0 ? RobotState.Paused : RobotState.Pausing;
-                return g.Rate == 1 ? RobotState.Executing : RobotState.Resuming;
+                if (_actives.Count == 0) return RobotState.Idle;
+                var states = new HashSet<string>(_actives.Select(g => g.State));
+                foreach (var s in new[] { RobotState.Executing, RobotState.Resuming, RobotState.Pausing, RobotState.Stopping })
+                    if (states.Contains(s)) return s;
+                return RobotState.Paused;
             }
         }
 
-        public string ActiveGoalId => _active?.Id;
-        public string PauseReason => _active?.PauseReason;
+        public string ActiveGoalId => _actives.Count > 0 ? _actives[0].Id : null;
+        public IReadOnlyList<string> ActiveGoalIds => _actives.Select(g => g.Id).ToList();
+        public string PauseReason => _actives.FirstOrDefault(g => g.PauseReason != null)?.PauseReason;
         public int QueuedCount => _queue.Count;
 
         public JObject StatePayload()
@@ -108,19 +130,28 @@ namespace RobotMarket.RemoteControl
             var positions = new JObject();
             foreach (var name in _joints.Keys)
                 positions[name] = pos.TryGetValue(name, out var x) ? new JValue(x) : JValue.CreateNull();
+            var goals = new JObject();
+            foreach (var g in _actives)
+                goals[g.Id] = new JObject
+                {
+                    ["state"] = g.State, ["joints"] = new JArray(g.Spec.JointNames), ["pause_reason"] = g.PauseReason,
+                };
             return new JObject
             {
                 ["state"] = State,
-                ["goal_id"] = _active?.Id,
+                ["goal_id"] = ActiveGoalId,
+                ["active"] = new JArray(_actives.Select(g => g.Id)),
+                ["goals"] = goals,
                 ["queued"] = new JArray(_queue.Select(q => q.Id)),
-                ["pause_reason"] = _active?.PauseReason,
+                ["pause_reason"] = PauseReason,
                 ["positions"] = positions,
             };
         }
 
         void PublishState()
         {
-            string key = State + "|" + (_active?.Id ?? "") + "|" + string.Join(",", _queue.Select(q => q.Id)) + "|" + (_active?.PauseReason ?? "");
+            string key = State + "|" + string.Join(",", _actives.Select(g => g.Id + ":" + g.State + ":" + g.PauseReason))
+                         + "|" + string.Join(",", _queue.Select(q => q.Id));
             if (key == _lastStateKey) return;
             _lastStateKey = key;
             _emit(MsgType.State, null, StatePayload());
@@ -159,29 +190,37 @@ namespace RobotMarket.RemoteControl
             try { spec = GoalParser.Parse(env.Payload, _joints); }
             catch (GoalException e) { Reject(goalId, e.Message); return; }
 
-            bool busy = _active != null || _queue.Count > 0;
+            bool busy = _actives.Count > 0 || _queue.Count > 0;
             if (busy && spec.OnBusy == "reject") { Reject(goalId, "robot is busy"); return; }
             if (busy && spec.OnBusy == "replace")
             {
                 foreach (var q in _queue.ToList()) Finish(q, GoalStatus.Canceled, "replaced by a new goal");
                 _queue.Clear();
-                if (_active != null && _active.EndStatus == null)
-                    BeginEnd(_active, GoalStatus.Canceled, "replaced by a new goal");
+                foreach (var a in _actives)
+                    if (a.EndStatus == null) BeginEnd(a, GoalStatus.Canceled, "replaced by a new goal");
             }
-            var goal = new Goal { Id = goalId, Spec = spec };
+            var goal = new Goal { Id = goalId, Spec = spec, JointSet = new HashSet<string>(spec.JointNames) };
             _knownIds.Add(goalId);
-            _queue.AddLast(goal);
-            int position = _queue.Count - (_active != null ? 0 : 1);
+            _queue.Add(goal);
+            StartReady();
+            int position;
+            if (_actives.Contains(goal)) position = 0;
+            else
+            {
+                int index = _queue.IndexOf(goal);
+                int ahead = _actives.Count(a => !goal.Parallel || a.JointSet.Overlaps(goal.JointSet))
+                            + _queue.Take(Math.Max(0, index)).Count(q => !goal.Parallel || q.JointSet.Overlaps(goal.JointSet));
+                position = Math.Max(1, ahead);
+            }
             _emit(MsgType.Accepted, goalId, new JObject { ["queue_position"] = position });
-            if (_active == null) StartNext();
         }
 
         // ── control (also used locally, e.g. by the heartbeat watchdog) ──────
 
         public (bool ok, string message) Pause(string goalId, string reason = "requested")
         {
-            var g = _active;
-            if (g == null || g.Id != goalId)
+            var g = FindActive(goalId);
+            if (g == null)
                 return _queue.Any(q => q.Id == goalId) ? (false, "goal is queued, not running") : (false, "no such goal");
             if (g.EndStatus != null) return (false, "goal is ending");
             if (g.TargetRate == 0) return (true, "already paused");
@@ -192,8 +231,8 @@ namespace RobotMarket.RemoteControl
 
         public (bool ok, string message) Resume(string goalId)
         {
-            var g = _active;
-            if (g == null || g.Id != goalId) return (false, "no such goal");
+            var g = FindActive(goalId);
+            if (g == null) return (false, "no such goal");
             if (g.EndStatus != null) return (false, "goal is ending");
             if (g.TargetRate == 1) return (true, "already running");
             g.TargetRate = 1;
@@ -210,8 +249,8 @@ namespace RobotMarket.RemoteControl
                 Finish(queued, GoalStatus.Canceled, "canceled while queued");
                 return (true, "");
             }
-            var g = _active;
-            if (g == null || g.Id != goalId) return (false, "no such goal");
+            var g = FindActive(goalId);
+            if (g == null) return (false, "no such goal");
             if (g.EndStatus != null) return (true, "already ending");
             BeginEnd(g, GoalStatus.Canceled, "canceled");
             return (true, "");
@@ -221,29 +260,25 @@ namespace RobotMarket.RemoteControl
         {
             foreach (var q in _queue.ToList()) Finish(q, GoalStatus.Stopped, "robot stopped");
             _queue.Clear();
-            if (_active != null) BeginEnd(_active, GoalStatus.Stopped, "robot stopped");
+            foreach (var a in _actives) BeginEnd(a, GoalStatus.Stopped, "robot stopped");
             return (true, "");
         }
 
-        /// <summary>Pause whatever is running (e.g. reason "connection_lost").</summary>
+        /// <summary>Pause everything that is running (e.g. reason "connection_lost").</summary>
         public void PauseFor(string reason)
         {
-            if (_active != null && _active.EndStatus == null && _active.TargetRate != 0)
-            {
-                Pause(_active.Id, reason);
-                PublishState();
-            }
+            bool changed = false;
+            foreach (var a in _actives)
+                if (a.EndStatus == null && a.TargetRate != 0) { Pause(a.Id, reason); changed = true; }
+            if (changed) PublishState();
         }
 
         public void AbortAll(string message)
         {
             foreach (var q in _queue.ToList()) Finish(q, GoalStatus.Aborted, message);
             _queue.Clear();
-            if (_active != null)
-            {
-                Finish(_active, GoalStatus.Aborted, message);
-                _active = null;
-            }
+            foreach (var a in _actives.ToList()) Finish(a, GoalStatus.Aborted, message);
+            _actives.Clear();
             PublishState();
         }
 
@@ -256,38 +291,61 @@ namespace RobotMarket.RemoteControl
 
         // ── motion ───────────────────────────────────────────────────────────
 
-        void StartNext()
+        /// <summary>Start queued goals that may run now, in queue order: a "parallel" goal when none of its joints
+        /// is used by a running goal or an earlier queued goal; any other goal only when idle and first in line.</summary>
+        void StartReady()
         {
-            while (_queue.Count > 0 && _active == null)
+            var busy = new HashSet<string>(_actives.SelectMany(a => a.JointSet));
+            foreach (var g in _queue.ToList())
             {
-                var g = _queue.First.Value;
-                _queue.RemoveFirst();
-                var pos = _driver.ReadPositions();
-                var start = g.Spec.JointNames.Select(n => pos[n]).ToArray();
-                try
+                bool ok = g.Parallel ? !g.JointSet.Overlaps(busy) : _actives.Count == 0 && _queue[0] == g;
+                if (ok)
                 {
-                    GoalParser.CheckSegmentSpeed(g.Spec.JointNames, _joints, start, g.Spec.Positions[0], g.Spec.Times[0], "start→point 0");
-                }
-                catch (GoalException e)
-                {
-                    Finish(g, GoalStatus.Aborted, e.Message);
+                    _queue.Remove(g);
+                    if (Begin(g)) busy.UnionWith(g.JointSet);
                     continue;
                 }
-                g.Traj = new Trajectory(start, g.Spec.Times, g.Spec.Positions, g.Spec.Interpolation);
-                _active = g;
+                if (!g.Parallel) break;   // a sequential goal waits for idle; everything behind it waits too
+                busy.UnionWith(g.JointSet);
             }
             PublishState();
         }
 
+        bool Begin(Goal g)
+        {
+            var pos = _driver.ReadPositions();
+            var start = g.Spec.JointNames.Select(n => pos[n]).ToArray();
+            try
+            {
+                GoalParser.CheckSegmentSpeed(g.Spec.JointNames, _joints, start, g.Spec.Positions[0], g.Spec.Times[0], "start→point 0");
+            }
+            catch (GoalException e)
+            {
+                Finish(g, GoalStatus.Aborted, e.Message);
+                return false;
+            }
+            g.Traj = new Trajectory(start, g.Spec.Times, g.Spec.Positions, g.Spec.Interpolation);
+            _actives.Add(g);
+            return true;
+        }
+
         public void Tick(double dt)
         {
-            if (_active == null)
+            if (_actives.Count == 0)
             {
-                if (_queue.Count > 0) StartNext();
+                if (_queue.Count > 0) StartReady();
                 return;
             }
-            var g = _active;
+            bool finished = false;
+            foreach (var g in _actives.ToList())
+                if (TickGoal(g, dt)) { _actives.Remove(g); finished = true; }
+            if (finished || _queue.Count > 0) StartReady();
+            PublishState();
+        }
 
+        /// <summary>Advance one goal; true when it has ended.</summary>
+        bool TickGoal(Goal g, double dt)
+        {
             // Ramp the time scale towards its target, integrating time with the mean rate
             double step = dt / DecelTime, r0 = g.Rate;
             if (g.Rate < g.TargetRate) g.Rate = Math.Min(g.TargetRate, g.Rate + step);
@@ -318,16 +376,14 @@ namespace RobotMarket.RemoteControl
             if (g.Time >= g.Traj.Duration)
             {
                 Finish(g, GoalStatus.Succeeded, "");
-                _active = null;
-                StartNext();
+                return true;
             }
-            else if (g.EndStatus != null && g.Rate == 0)
+            if (g.EndStatus != null && g.Rate == 0)
             {
                 Finish(g, g.EndStatus, g.EndMessage);
-                _active = null;
-                StartNext();
+                return true;
             }
-            PublishState();
+            return false;
         }
 
         double[] Measured(Goal g)
@@ -352,7 +408,7 @@ namespace RobotMarket.RemoteControl
         {
             _emit(MsgType.Feedback, g.Id, new JObject
             {
-                ["state"] = State,
+                ["state"] = g.State,
                 ["point_index"] = Math.Min(g.NextPoint, g.Spec.Times.Length - 1),
                 ["time"] = Math.Round(g.Time, 4),
                 ["duration"] = g.Traj.Duration,

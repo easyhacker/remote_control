@@ -254,14 +254,53 @@ class RobotHandle(_Events):
             pos = self.state.get("positions") or {}
         return {k: float(v) for k, v in pos.items() if v is not None}
 
-    async def save_pose(self, name: str, joints: Optional[Sequence[str]] = None) -> Path:
-        """Save the current positions of `joints` (default: all) as pose `name` (replaces an existing one)."""
+    async def save_pose(self, name: str, joints: Optional[Sequence[str]] = None,
+                        group: Optional[str] = None) -> Path:
+        """Save the current positions of `joints` (default: all, or the joints of `group`) as pose `name`
+        (replaces an existing one). A group pose moves only that group when used."""
+        if group and not joints:
+            joints = self.joint_groups().get(group)
+            if not joints:
+                raise RobotError(f"no joint group '{group}'")
         pos = await self.current_positions()
         names = list(joints) if joints else self.joint_names
         missing = [n for n in names if n not in pos]
         if missing:
             raise RobotError(f"no position for joint(s) {', '.join(missing)}")
-        return self.store.save_pose(name, names, [pos[n] for n in names])
+        return self.store.save_pose(name, names, [pos[n] for n in names], group=group)
+
+    # joint groups (saved in groups.json)
+
+    def joint_groups(self) -> Dict[str, List[str]]:
+        """Saved joint groups: name -> joint names."""
+        return self.store.groups() if self.controller.data_dir is not None else {}
+
+    def save_joint_group(self, name: str, joints: Sequence[str]) -> Path:
+        unknown = [j for j in joints if j not in self.joint_names]
+        if unknown:
+            raise RobotError(f"unknown joint(s): {', '.join(unknown)}")
+        return self.store.save_group(name, joints)
+
+    def delete_joint_group(self, name: str) -> None:
+        self.store.delete_group(name)
+
+    @property
+    def parallel_on_busy(self) -> str:
+        """on_busy for independent group motion: "parallel" if the robot supports it, else "queue"."""
+        return "parallel" if self.supports.get("parallel_goals") else "queue"
+
+    async def move_group(self, name: str, positions: Mapping[str, float], duration: Optional[float] = None,
+                         **execute_kwargs: Any) -> GoalHandle:
+        """Move the joints of group `name` (only those listed in positions must belong to it). Runs in parallel
+        with goals on other joints when the robot supports it."""
+        joints = self.joint_groups().get(name)
+        if joints is None:
+            raise RobotError(f"no joint group '{name}'")
+        outside = [n for n in positions if n not in joints]
+        if outside:
+            raise RobotError(f"joint(s) not in group '{name}': {', '.join(outside)}")
+        execute_kwargs.setdefault("on_busy", self.parallel_on_busy)
+        return await self.move_to(positions, duration, **execute_kwargs)
 
     def list_poses(self) -> List[str]:
         return self.store.list_poses()

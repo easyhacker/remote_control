@@ -141,15 +141,20 @@ class JointRow:
             self.slider.SetValue(max(0, min(SLIDER_RANGE, self.to_slider(x))))
 
 
+ALL_JOINTS = "All joints"
+
+
 class JogTab(wx.Panel):
     def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
         super().__init__(parent)
         self.frame = frame
         self.rows: Dict[str, JointRow] = {}
         bar = wx.BoxSizer(wx.HORIZONTAL)
-        self.group = wx.Choice(self, choices=["All"])
+        self.groups: List[Dict[str, Any]] = []
+        self.group = wx.Choice(self, choices=[ALL_JOINTS])
         self.group.SetSelection(0)
-        self.group.SetToolTip("Show the joints of one arm / group")
+        self.group.SetToolTip("Joint group: shows its joints; Home, Save pose and Stop act on it only.\n"
+                              "Groups move independently: one can move while another is moving.")
         self.group.Bind(wx.EVT_CHOICE, lambda e: self.apply_group())
         self.step = wx.Choice(self, choices=[f"{r:g} rad / {m * 1000:g} mm" for n, r, m in STEPS])
         self.step.SetSelection(1)
@@ -164,16 +169,20 @@ class JogTab(wx.Panel):
             bar.Add(w, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
 
         buttons = wx.BoxSizer(wx.HORIZONTAL)
-        home = wx.Button(self, label="Home")
-        home.SetToolTip("Move to the home pose (built-in: all joints 0, unless you saved a pose named 'home')")
-        home.Bind(wx.EVT_BUTTON, lambda e: frame.go_pose("home"))
-        save = wx.Button(self, label="Save pose…")
-        save.SetToolTip("Save the current joint positions as a named pose")
-        save.Bind(wx.EVT_BUTTON, lambda e: frame.save_pose_dialog())
-        buttons.Add(home, 0, wx.RIGHT, GAP)
-        buttons.Add(save, 0)
+        for label, handler, tip in [
+                ("Home", self.home, "Move the group to home (built-in: joints at 0, unless you saved a pose "
+                                    "named 'home')"),
+                ("Save pose…", lambda: frame.save_pose_dialog(self.group_name),
+                 "Save the current positions of the group's joints as a named pose\n"
+                 "(e.g. 'close_left_gripper' for the left gripper group)"),
+                ("Stop group", self.stop_group, "Cancel the motions of this group's joints; other groups keep moving"),
+                ("Groups…", frame.groups_dialog, "Create, edit and delete joint groups")]:
+            btn = wx.Button(self, label=label)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            buttons.Add(btn, 0, wx.RIGHT, GAP)
 
-        self.area = wx.ScrolledWindow(self, style=wx.VSCROLL)
+        self.area = wx.ScrolledWindow(self, style=wx.VSCROLL | wx.ALWAYS_SHOW_SB)
         self.area.SetScrollRate(0, self.FromDIP(10))
         self.grid = wx.FlexGridSizer(cols=6, vgap=2, hgap=4)
         self.grid.AddGrowableCol(4, 1)
@@ -213,20 +222,51 @@ class JogTab(wx.Panel):
             row.value.Bind(wx.EVT_TEXT_ENTER, lambda e, r=row: self._enter(r))
             row.value.Bind(wx.EVT_KILL_FOCUS, lambda e, r=row: self._leave(e, r))
             row.value.Bind(wx.EVT_SET_FOCUS, lambda e, r=row: self._focus(e, r))
+            wheel_scrolls_parent(row.value)
+            wheel_scrolls_parent(row.slider, always=True)     # the wheel never moves a joint
             self.rows[j.name] = row
         if not joints:
             self.grid.Add(wx.StaticText(self.area, label="Waiting for a robot…"))
-        prefixes = sorted({n.split("_")[0] + "_" for n in names if "_" in n and len(n.split("_")[0]) <= 3})
-        self.group.Set(["All"] + prefixes)
-        self.group.SetSelection(0)
+        self.refresh_groups()
+
+    @property
+    def group_name(self) -> Optional[str]:
+        """The selected group, None for all joints."""
+        i = self.group.GetSelection()
+        return self.groups[i - 1]["name"] if 0 < i <= len(self.groups) else None
+
+    def refresh_groups(self, select: Optional[str] = None) -> None:
+        current = select or self.group_name
+        try:
+            self.groups = self.frame.backend.groups()
+        except Exception as exc:
+            self.frame.log(f"groups: {exc}")
+            self.groups = []
+        self.group.Set([ALL_JOINTS] + [g["name"] + (" (suggested)" if g["builtin"] else "") for g in self.groups])
+        names = [g["name"] for g in self.groups]
+        self.group.SetSelection(names.index(current) + 1 if current in names else 0)
         self.apply_group()
 
     def apply_group(self) -> None:
-        g = self.group.GetStringSelection()
+        joints = self.frame.backend.group_joints(self.group_name) if self.group_name else None
         for name, row in self.rows.items():
-            row.show(g in ("", "All") or name.startswith(g))
+            row.show(joints is None or name in joints)
         self.area.Layout()
         self.area.FitInside()
+
+    def home(self) -> None:
+        g = self.group_name
+        self.frame.run(self.frame.backend.go_home(g, self.speed_fraction),
+                       lambda goal: self.frame.log(f"→ home{' ' + g if g else ''} (goal {goal.goal_id})"), "home")
+
+    def stop_group(self) -> None:
+        g = self.group_name
+        b = self.frame.backend
+        if g is None:
+            self.frame.on_stop(None)
+            return
+        self.frame.run(b.cancel(b.group_joints(g)), lambda ack: self.frame.log(f"stop {g}: {ack.get('message')}"),
+                       f"stop {g}")
 
     def update(self, pos: Dict[str, float]) -> None:
         for name, row in self.rows.items():
@@ -288,22 +328,128 @@ class JogTab(wx.Panel):
                                      label=f"{row.joint.name} → {target:.{row.digits}f}"), what=row.joint.name)
 
 
+class GroupsDialog(wx.Dialog):
+    """Joint groups: pick a group (or type a new name), tick its joints, Save. Suggested groups become saved
+    groups when saved."""
+
+    def __init__(self, frame: "ToolboxFrame") -> None:
+        super().__init__(frame, title="Joint groups", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.frame = frame
+        self.b = frame.backend
+        self.last_saved: Optional[str] = None
+        self.list = wx.ListBox(self, size=self.FromDIP(wx.Size(170, 260)), style=wx.LB_SINGLE | wx.LB_ALWAYS_SB)
+        self.list.Bind(wx.EVT_LISTBOX, lambda e: self.show_group())
+        self.name = wx.TextCtrl(self)
+        self.joints = wx.CheckListBox(self, choices=list(self.b.robot.joint_names),
+                                      size=self.FromDIP(wx.Size(220, 260)), style=wx.LB_ALWAYS_SB)
+        save = wx.Button(self, label="Save")
+        save.SetToolTip("Save the group under the name above (replaces a group with that name)")
+        save.Bind(wx.EVT_BUTTON, lambda e: self.save())
+        delete = wx.Button(self, label="Delete")
+        delete.Bind(wx.EVT_BUTTON, lambda e: self.delete())
+        new = wx.Button(self, label="New")
+        new.Bind(wx.EVT_BUTTON, lambda e: self.new())
+
+        right = wx.BoxSizer(wx.VERTICAL)
+        right.Add(wx.StaticText(self, label="Name"), 0)
+        right.Add(self.name, 0, wx.EXPAND | wx.BOTTOM, GAP)
+        right.Add(wx.StaticText(self, label="Joints"), 0)
+        right.Add(self.joints, 1, wx.EXPAND)
+        left = wx.BoxSizer(wx.VERTICAL)
+        left.Add(wx.StaticText(self, label="Groups (* = suggested, not saved)"), 0)
+        left.Add(self.list, 1, wx.EXPAND)
+        body = wx.BoxSizer(wx.HORIZONTAL)
+        body.Add(left, 1, wx.EXPAND | wx.RIGHT, GAP)
+        body.Add(right, 1, wx.EXPAND)
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        for btn in (new, save, delete):
+            buttons.Add(btn, 0, wx.RIGHT, GAP)
+        buttons.AddStretchSpacer()
+        buttons.Add(wx.Button(self, wx.ID_CLOSE), 0)
+        self.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CLOSE), id=wx.ID_CLOSE)
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(body, 1, wx.EXPAND | wx.ALL, GAP)
+        s.Add(buttons, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.SetSizerAndFit(s)
+        self.reload()
+
+    def reload(self, select: Optional[str] = None) -> None:
+        self.groups = self.b.groups()
+        self.list.Set([g["name"] + (" *" if g["builtin"] else "") for g in self.groups])
+        names = [g["name"] for g in self.groups]
+        if select in names:
+            self.list.SetSelection(names.index(select))
+            self.show_group()
+        elif names:
+            self.list.SetSelection(0)
+            self.show_group()
+
+    def show_group(self) -> None:
+        i = self.list.GetSelection()
+        if i < 0:
+            return
+        g = self.groups[i]
+        self.name.SetValue(g["name"])
+        self.joints.SetCheckedStrings(g["joints"])
+
+    def new(self) -> None:
+        self.list.SetSelection(wx.NOT_FOUND)
+        self.name.SetValue("")
+        self.joints.SetCheckedItems([])
+        self.name.SetFocus()
+
+    def save(self) -> None:
+        name = self.name.GetValue().strip()
+        joints = list(self.joints.GetCheckedStrings())
+        saved = {g["name"] for g in self.groups if not g["builtin"]}
+        i = self.list.GetSelection()
+        editing = self.groups[i]["name"] if i >= 0 else None
+        if name in saved and name != editing and wx.MessageBox(
+                f"A group named '{name}' already exists.\n\nReplace it?", "Joint groups",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) != wx.YES:
+            return
+        try:
+            self.b.save_group(name, joints)
+        except Exception as exc:
+            wx.MessageBox(str(exc), "Joint groups", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.frame.log(f"saved group '{name}': {', '.join(joints)}")
+        self.last_saved = name
+        self.reload(name)
+
+    def delete(self) -> None:
+        i = self.list.GetSelection()
+        if i < 0:
+            return
+        g = self.groups[i]
+        if g["builtin"]:
+            wx.MessageBox("A suggested group is not saved, so there is nothing to delete.", "Joint groups",
+                          wx.OK | wx.ICON_INFORMATION, self)
+            return
+        self.b.delete_group(g["name"])
+        self.frame.log(f"deleted group '{g['name']}'")
+        self.reload()
+
+
 # ── poses tab ─────────────────────────────────────────────────────────────────
 
 class PosesTab(wx.Panel):
     def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
         super().__init__(parent)
         self.frame = frame
-        self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.VSCROLL)
+        self.list.SetMinSize(self.FromDIP(wx.Size(-1, 120)))     # scrolls instead of growing the window
         self.builtin: set = set()
-        for i, (title, width) in enumerate([("Name", 150), ("Joints", 50), ("Saved", 150)]):
+        for i, (title, width) in enumerate([("Name", 150), ("Group", 100), ("Joints", 50), ("Saved", 150)]):
             self.list.InsertColumn(i, title, width=self.FromDIP(width))
         self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda e: self.go())
-        self.list.SetToolTip("Double-click a pose to move there")
+        self.list.SetToolTip("Double-click a pose to move there. A group pose moves only its group's joints,\n"
+                             "so it can run while other groups move.")
         row = wx.BoxSizer(wx.HORIZONTAL)
         for label, handler, tip in [("Go", self.go, "Move to the selected pose"),
-                                    ("Home", lambda: frame.go_pose("home"), "Move to the home pose"),
-                                    ("Save pose…", frame.save_pose_dialog, "Save the current positions"),
+                                    ("Home", lambda: frame.go_pose("home"), "Move all joints to the home pose"),
+                                    ("Save pose…", lambda: frame.save_pose_dialog(frame.jog.group_name),
+                                     "Save the current positions (of the group selected in Joint jog)"),
                                     ("Delete", self.delete, "Delete the selected pose")]:
             btn = wx.Button(self, label=label)
             btn.SetToolTip(tip)
@@ -327,8 +473,9 @@ class PosesTab(wx.Panel):
         self.builtin = {p["name"] for p in poses if p.get("builtin")}
         for p in poses:
             i = self.list.InsertItem(self.list.GetItemCount(), p["name"])
-            self.list.SetItem(i, 1, str(p["joints"]))
-            self.list.SetItem(i, 2, p["saved_at"] if p.get("builtin") else p["saved_at"].replace("T", " ")[:19])
+            self.list.SetItem(i, 1, p.get("group") or "all")
+            self.list.SetItem(i, 2, str(p["joints"]))
+            self.list.SetItem(i, 3, p["saved_at"] if p.get("builtin") else p["saved_at"].replace("T", " ")[:19])
 
     def selected(self) -> Optional[str]:
         i = self.list.GetFirstSelected()
@@ -362,10 +509,11 @@ class PosesTab(wx.Panel):
 
 # ── Tool & Targets tab: chain, TCP, targets ────────────────────────────────────
 
-def wheel_scrolls_parent(ctrl: wx.Window) -> None:
-    """The mouse wheel over an unfocused number field scrolls the panel instead of changing the value."""
+def wheel_scrolls_parent(ctrl: wx.Window, always: bool = False) -> None:
+    """The mouse wheel over an unfocused number field (any slider, with always=True) scrolls the panel instead of
+    changing the value."""
     def on_wheel(event: wx.MouseEvent) -> None:
-        if ctrl.HasFocus() or any(c.HasFocus() for c in ctrl.GetChildren()):
+        if not always and (ctrl.HasFocus() or any(c.HasFocus() for c in ctrl.GetChildren())):
             event.Skip()
             return
         parent = ctrl.GetParent()
@@ -1261,21 +1409,39 @@ class ToolboxFrame(wx.Frame):
                     continue          # ask for another name
             return name
 
-    def save_pose_dialog(self) -> None:
-        """Prompt for a name; confirm before replacing an existing pose."""
+    def save_pose_dialog(self, group: Optional[str] = None) -> None:
+        """Prompt for a name; confirm before replacing an existing pose. With a group, only its joints are saved."""
         if self.backend.robot is None:
             self.log("save pose: no robot connected")
             return
-        name = self.ask_name("Save pose", "Pose name:", set(self.poses.names()), self.poses.selected() or "",
+        if group:
+            joints = self.backend.group_joints(group)
+            prompt = f"Pose name for group '{group}' ({len(joints)} joints: {', '.join(joints)}):"
+            default = ""
+        else:
+            prompt, default = "Pose name (all joints):", self.poses.selected() or ""
+        name = self.ask_name("Save pose", prompt, set(self.poses.names()), default,
                              lambda n: ("This replaces the built-in home pose (all joints 0)" if n in self.poses.builtin
                                         else f"A pose named '{n}' already exists"))
         if name is None:
             return
 
         def done(path) -> None:
-            self.log(f"saved pose '{name}'")
+            self.log(f"saved pose '{name}'" + (f" for group '{group}'" if group else ""))
             self.poses.refresh()
-        self.run(self.backend.save_pose(name), done, "save pose")
+        self.run(self.backend.save_pose(name, group), done, "save pose")
+
+    def groups_dialog(self) -> None:
+        if self.backend.robot is None:
+            self.log("groups: no robot connected")
+            return
+        if self.backend.data_dir is None:
+            self.log("groups: no data folder (groups are saved in the robot's groups.json)")
+            return
+        with GroupsDialog(self) as dlg:
+            dlg.ShowModal()
+            selected = dlg.last_saved
+        self.jog.refresh_groups(selected)
 
     # ── backend events ───────────────────────────────────────────────────────
 
@@ -1300,6 +1466,7 @@ class ToolboxFrame(wx.Frame):
         self.names.SetLabel(f"{n['project']} / {n['stage']} / {n['robot']}")
         self.on_state(robot.state or {})
         self.jog.build(list(robot.joints))
+        self.jog.refresh_groups()
         self.cart.robot_changed()
         self.poses.refresh()
         self.Layout()
@@ -1308,6 +1475,8 @@ class ToolboxFrame(wx.Frame):
         text = f"state: {state.get('state', '—')}"
         if state.get("pause_reason"):
             text += f" [{state['pause_reason']}]"
+        if len(state.get("active") or []) > 1:
+            text += f"  {len(state['active'])} goals"
         if state.get("queued"):
             text += f"  +{len(state['queued'])} queued"
         self.state.SetLabel(text)

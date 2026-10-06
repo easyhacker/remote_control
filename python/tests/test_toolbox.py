@@ -274,6 +274,52 @@ class BackendTests(unittest.TestCase):
         self.backend.delete_pose("home")                               # back to the built-in one
         self.assertTrue(self.backend.list_poses()[0]["builtin"])
 
+    def test_joint_groups_and_group_poses(self):
+        b = self.backend
+        b.save_group("arm", ["shoulder_yaw", "shoulder_pitch", "elbow", "wrist"])
+        b.save_group("gripper", ["gripper"])
+        saved = [g for g in b.groups() if not g["builtin"]]
+        self.assertEqual([(g["name"], g["joints"]) for g in saved],
+                         [("arm", ["shoulder_yaw", "shoulder_pitch", "elbow", "wrist"]), ("gripper", ["gripper"])])
+        with self.assertRaises(Exception):
+            b.save_group("bad", ["no_such_joint"])
+        # a group pose stores only the group's joints, and moves only them
+        self.run_(b.move_joints({"gripper": 0.04, "elbow": 0.2}, duration=0.8))
+        self.wait_goal()
+        self.run_(b.save_pose("close_gripper", group="gripper"))
+        pose = next(p for p in b.list_poses() if p["name"] == "close_gripper")
+        self.assertEqual((pose["group"], pose["joints"]), ("gripper", 1))
+        self.run_(b.move_joints({"gripper": 0.0}, duration=0.8))
+        self.wait_goal()
+        # the arm moves slowly while the gripper pose runs in parallel and finishes first
+        arm = self.run_(b.move_joints({"elbow": 1.0}, duration=1.5))
+        t0 = time.monotonic()
+        grip = self.run_(b.go_to_pose("close_gripper", speed=1.0))
+        self.assertEqual(self.run_(grip.result(5))["status"], "succeeded")
+        self.assertLess(time.monotonic() - t0, 1.2)                          # did not wait for the arm
+        self.assertFalse(arm.done)
+        self.assertAlmostEqual(self.robot.positions()["gripper"], 0.04, places=4)
+        # stopping one group leaves the other moving
+        self.run_(b.move_joints({"gripper": 0.0}, duration=1.0))
+        self.run_(b.cancel(b.group_joints("gripper")))
+        self.assertFalse(arm.done)
+        self.assertEqual(self.run_(arm.result(5))["status"], "succeeded")
+        self.assertAlmostEqual(self.robot.positions()["elbow"], 1.0, places=3)
+        # home for one group only
+        self.run_(b.go_home("arm", speed=1.0))
+        self.wait_goal()
+        pos = self.robot.positions()
+        self.assertAlmostEqual(pos["elbow"], 0.0, places=3)
+        self.assertGreater(pos["gripper"], 0.0)                              # untouched
+        b.delete_group("gripper")
+        self.assertNotIn("gripper", [g["name"] for g in b.groups() if not g["builtin"]])
+
+    def test_suggested_groups_from_chains(self):
+        self.backend.save_chain("arm chain", "base_link", "wrist_link")
+        g = next(g for g in self.backend.groups() if g["name"] == "arm chain")
+        self.assertTrue(g["builtin"])
+        self.assertEqual(g["joints"], ["shoulder_yaw", "shoulder_pitch", "elbow", "wrist"])
+
     def test_tcp_moves_the_tool_point(self):
         xyz0, _ = self.backend.tool_pose("wrist_link", "base_link")
         self.backend.set_tcp("wrist_link", (0, 0, 0.1), (0, 0, 0))

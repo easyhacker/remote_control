@@ -187,7 +187,8 @@ class BackendTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         url = f"ws://127.0.0.1:{free_port()}/motion"
         self.logs = []
-        self.backend = Backend(post=lambda fn: fn(), url=url, data_dir=self.tmp.name)
+        self.planner_port = free_port()
+        self.backend = Backend(post=lambda fn: fn(), url=url, data_dir=self.tmp.name, planner_port=self.planner_port)
         self.backend.on_log = self.logs.append
         self.backend.start()
         self.robot = _RobotThread(url)
@@ -273,6 +274,147 @@ class BackendTests(unittest.TestCase):
         self.assertAlmostEqual(self.robot.positions()["elbow"], 0.3, places=3)
         self.backend.delete_pose("home")                               # back to the built-in one
         self.assertTrue(self.backend.list_poses()[0]["builtin"])
+
+    # ── Motion tab ───────────────────────────────────────────────────────────
+
+    def wait_until(self, check, timeout=10.0, what="condition"):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if check():
+                return
+            time.sleep(0.02)
+        self.fail(f"{what} never happened (motion: {self.backend.motion.state} / {self.backend.motion.message}; "
+                  f"log: {self.logs[-5:]})")
+
+    def test_motion_program_loops_pauses_resumes_and_stops(self):
+        b, m = self.backend, self.backend.motion
+        program = {"scope": {"kind": "joint", "name": "elbow"}, "loop": True, "steps": [
+            {"type": "joints", "positions": {"elbow": 0.6}, "speed": 1.0},
+            {"type": "joints", "positions": {"elbow": -0.6}, "speed": 1.0, "wait": 0.1},
+        ]}
+        self.run_(m.run(program))
+        self.wait_until(lambda: m.loop_count >= 1, what="a second loop")
+        self.run_(m.pause())
+        self.assertEqual(m.state, "paused")
+        time.sleep(0.6)                                             # decelerated and holding
+        x = self.robot.positions()["elbow"]
+        time.sleep(0.3)
+        self.assertAlmostEqual(self.robot.positions()["elbow"], x, places=4)
+        self.run_(m.resume())
+        self.wait_until(lambda: abs(self.robot.positions()["elbow"] - x) > 0.05, what="moving again")
+        self.run_(m.stop())
+        self.wait_until(lambda: m.state == "idle", what="the program to stop")
+        self.assertIn("stopped", m.message)
+        m.save_program("swing", program)
+        self.assertEqual(m.programs()["swing"]["steps"][1]["wait"], 0.1)
+
+    def _speed_through(self, blend):
+        """Run elbow 0 → 0.4 → 0.8 → 1.2 and return the elbow's speed where it passes 0.4."""
+        b, m = self.backend, self.backend.motion
+        self.run_(b.move_joints({"elbow": 0.0}, duration=0.5))
+        self.wait_goal()
+        program = {"scope": {"kind": "joint", "name": "elbow"}, "blend": blend, "steps": [
+            {"type": "joints", "positions": {"elbow": x}, "speed": 0.5} for x in (0.4, 0.8, 1.2)]}
+        samples = []
+        self.run_(m.run(program))
+        while m.running or not samples or samples[-1][1] < 1.199:
+            samples.append((time.monotonic(), self.robot.positions()["elbow"]))
+            time.sleep(0.005)
+            if len(samples) > 3000:
+                break
+        self.assertEqual(m.message, "program finished")
+        self.assertEqual(m.step_index, 2)                         # the highlight followed the steps
+        i = min(range(len(samples)), key=lambda k: abs(samples[k][1] - 0.4))
+        (t0, x0), (t1, x1) = samples[max(0, i - 4)], samples[min(len(samples) - 1, i + 4)]
+        return (x1 - x0) / (t1 - t0)
+
+    def test_motion_smooth_program_does_not_stop_between_steps(self):
+        self.assertGreater(self._speed_through(blend=True), 0.3)  # passes step 1 at speed
+        self.assertLess(self._speed_through(blend=False), 0.15)   # stops at step 1
+
+    def test_motion_scope_limits_which_joints_a_pose_moves(self):
+        b, m = self.backend, self.backend.motion
+        self.run_(b.move_joints({"elbow": 0.4, "gripper": 0.03, "wrist": 0.5}, duration=1.0))
+        self.wait_goal()
+        self.run_(b.save_pose("bent"))
+        self.run_(b.move_joints({"elbow": 0.0, "gripper": 0.0, "wrist": 0.0}, duration=1.0))
+        self.wait_goal()
+        self.run_(m.run({"scope": {"kind": "joint", "name": "elbow"},
+                         "steps": [{"type": "pose", "pose": "bent", "speed": 1.0}]}))
+        self.wait_until(lambda: m.state == "idle" and m.message == "program finished", what="the program to finish")
+        pos = self.robot.positions()
+        self.assertAlmostEqual(pos["elbow"], 0.4, places=3)
+        self.assertAlmostEqual(pos["gripper"], 0.0, places=4)           # not in the scope: untouched
+        self.assertAlmostEqual(pos["wrist"], 0.0, places=3)
+        with self.assertRaises(Exception):                               # a TCP target needs a chain scope
+            self.run_(m.plan_step({"type": "target", "target": "frame:x"}, {"kind": "joint", "name": "elbow"}))
+
+    def test_motion_linear_tcp_move_follows_a_straight_line(self):
+        b, m = self.backend, self.backend.motion
+        self.run_(b.move_joints({"shoulder_pitch": 0.4, "elbow": 0.9}, duration=1.0))
+        self.wait_goal()
+        time.sleep(0.3)                                                  # positions polled
+        b.save_chain("arm", "base_link", "wrist_link")
+        (x, y, z), rpy = b.tool_pose("wrist_link", "base_link", "arm")
+        start, end = np.array([x, y, z]), np.array([x - 0.06, y, z - 0.04])
+        b.save_frame("goal", "base_link", tuple(end), rpy)
+        scope = {"kind": "chain", "name": "arm"}
+        step = {"type": "target", "target": "frame:goal", "label": "goal", "move": "linear", "speed": 0.1,
+                "position_only": True}
+        plan = self.run_(m.plan_step(step, scope))
+        chain = b.chain("wrist_link", "base_link", "arm")
+        line = (end - start) / np.linalg.norm(end - start)
+        times = [t for _, t in plan["path"]]
+        self.assertEqual(times, sorted(times))
+        for positions, _ in plan["path"]:                                # every sample on the straight line
+            p = chain.tool_pose({**b.positions, **positions})[:3, 3] - start
+            self.assertLess(np.linalg.norm(p - line * float(p @ line)), 0.002)
+        self.run_(m.run({"scope": scope, "steps": [step]}))
+        self.wait_until(lambda: m.state == "idle" and m.message == "program finished", what="the linear move")
+        reached = chain.tool_pose(self.robot.positions())[:3, 3]
+        self.assertLess(np.linalg.norm(reached - end), 0.003)
+
+    def test_motion_planner_stream_drives_the_scope(self):
+        b, m = self.backend, self.backend.motion
+        self.wait_until(lambda: m.planner_url, what="the planner endpoint")
+        received = []
+
+        async def planner():
+            try:
+                from websockets.asyncio.client import connect
+            except ImportError:
+                from websockets.client import connect  # type: ignore
+            import json
+            async with connect(m.planner_url) as ws:
+                received.append(json.loads(await ws.recv()))                     # hello
+                for _ in range(200):
+                    if m.planner_status()["following"]:
+                        break
+                    await asyncio.sleep(0.02)
+                for i in range(30):                                               # 30 frames, 50 Hz
+                    await ws.send(json.dumps({"positions": {"elbow": 0.02 * i, "wrist": 1.0}}))
+                    await asyncio.sleep(0.02)
+                await ws.send(json.dumps({"positions": {"elbow": 0.6}, "end": True}))
+                for _ in range(100):
+                    msg = json.loads(await ws.recv())
+                    if msg.get("type") == "state":
+                        received.append(msg)
+                        if not msg["following"]:
+                            break
+
+        t = threading.Thread(target=lambda: asyncio.run(planner()))
+        t.start()
+        self.wait_until(lambda: received, what="the planner's hello")
+        self.assertEqual(received[0]["type"], "hello")
+        self.assertIn("elbow", [j["name"] for j in received[0]["joints"]])
+        self.run_(m.follow({"kind": "joint", "name": "elbow"}))
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(received[-1]["following"])                              # the stream ended at its last pose
+        pos = self.robot.positions()
+        self.assertAlmostEqual(pos["elbow"], 0.6, places=3)
+        self.assertAlmostEqual(pos["wrist"], 0.0, places=4)                      # outside the scope: ignored
+        self.assertGreaterEqual(m.planner_poses, 30)
 
     def test_joint_groups_and_group_poses(self):
         b = self.backend

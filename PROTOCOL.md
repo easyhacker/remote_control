@@ -53,7 +53,7 @@ Sent right after connecting. It is sent again every `max(1 s, heartbeat_timeout)
 { "protocol": 1, "name": "Demo arm", "software": "remote-control-unity/0.1",
   "joints": [ { "name": "shoulder", "type": "revolute", "lower": -3.14, "upper": 3.14, "max_velocity": 2.0 } ],
   "supports": { "pause": true, "report_points": true, "report_progress": true, "pose_targets": false,
-                "describe": true, "visualize": true, "parallel_goals": true },
+                "describe": true, "visualize": true, "parallel_goals": true, "stream": true },
   "instance": "4f1c0a9e2b7d",
   "project": "My project", "stage": "robot0625",
   "state": { "...": "same as the state message" } }
@@ -195,6 +195,33 @@ reconnects and sends `hello` under it (see [Robot ids](#robot-ids)).
 - `interpolation`: `cubic` (default; smooth, zero velocity at the start and end) or `linear`.
 
 The motion starts at the robot's position when the goal begins and reaches `points[0]` at `points[0].time_from_start`.
+
+**Stream goals** (if `supports.stream`): `"stream": true` and no `points`. The goal is accepted, queued and run like
+any other: `on_busy`, `pause` / `resume` / `cancel` / `stop`, and parallel goals on other joints all apply. Instead of
+following a trajectory, it moves its joints towards the newest pose sent in `stream` messages.
+```json
+{ "joint_names": ["L_arm1", "L_arm2"], "stream": true, "speed": 1.0, "report": "progress", "progress_hz": 30,
+  "on_busy": "parallel" }
+```
+- `speed`, in (0, 1], default 1: each joint moves at most `speed × max_velocity` towards the streamed pose. A jump in
+  the stream therefore becomes a fast but limited move, never an instant one.
+- Until the first pose arrives, and whenever poses stop coming, the joints hold the last pose.
+- While paused, the robot keeps the newest pose but holds. After `resume` it moves towards that pose.
+- `feedback` for stream goals: `{ "state", "stream": true, "time", "rate", "poses_received", "positions" }`.
+- The goal ends `succeeded` after a `stream` with `"end": true`, once the joints are at the last pose. Otherwise it
+  ends with `cancel` or `stop`.
+
+### `stream`
+The newest pose for a stream goal. `goal_id` is set in the envelope, and it goes on the control channel. There is no
+ack, because streams arrive at frame rate, for example from a motion planner.
+```json
+{ "positions": [0.31, -0.42] }
+```
+- `positions`: in the goal's `joint_names` order. Values are clamped to the joint limits.
+- Optional `"end": true`: no more poses; the goal succeeds once the joints are at the last one. `{"end": true}` alone
+  ends at the pose sent before.
+- Poses for unknown or finished goals are dropped silently. A pose for a stream goal that is still queued is kept and
+  used when the goal starts.
 
 ### `pause` / `resume`
 `goal_id` is set in the envelope. `pause` slows the timeline to a halt along the path, then holds.

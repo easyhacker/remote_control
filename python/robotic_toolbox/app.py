@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import wx
 
-from . import __version__
+from . import __version__, unity_focus
 from .backend import Backend
 from .ik import Chain, IkResult
 
@@ -1302,6 +1302,408 @@ class CartesianTab(wx.ScrolledWindow):
         TreeDialog(self, self.b.description, base, end, pick).Show()
 
 
+# ── Motion tab: programs and the external planner ─────────────────────────────
+
+NEW_PROGRAM = "(new program)"
+STEP_KINDS = [("pose", "Saved pose"), ("joints", "Current position (scope joints)"), ("target", "TCP target")]
+
+
+class StepDialog(wx.Dialog):
+    """Add / edit one program step: a saved pose, the current position, or a TCP target (joint or linear move)."""
+
+    def __init__(self, parent: wx.Window, frame: "ToolboxFrame", scope: Dict[str, Any],
+                 step: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(parent, title="Motion step", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.frame, self.b, self.scope = frame, frame.backend, scope
+        step = dict(step or {"type": "pose", "speed": 0.5, "wait": 0.0})
+        self.kind = wx.RadioBox(self, label="Step", choices=[label for _, label in STEP_KINDS],
+                                majorDimension=1, style=wx.RA_SPECIFY_COLS)
+        self.kind.SetSelection([k for k, _ in STEP_KINDS].index(step.get("type", "pose")))
+        self.kind.Bind(wx.EVT_RADIOBOX, lambda e: self.update())
+        self.pose = wx.Choice(self, choices=[p["name"] for p in self.b.list_poses()])
+        self.targets = self.b.targets_list() if self.b.description else []
+        self.target = wx.Choice(self, choices=[label for _, label in self.targets])
+        self.move = wx.Choice(self, choices=["Joint move (IK at the target)", "Linear move (TCP in a straight line)"])
+        self.move.SetToolTip("Joint move: smooth, always possible when the target is reachable.\n"
+                             "Linear move: the TCP follows a straight line; fails if the line leaves the "
+                             "reachable space or the arm would flip on the way.")
+        self.move.Bind(wx.EVT_CHOICE, lambda e: self.update())
+        self.position_only = wx.CheckBox(self, label="Position only (keep the TCP orientation free)")
+        self.speed = wx.SpinCtrlDouble(self, min=1, max=100, inc=5, initial=50)
+        self.speed_label = wx.StaticText(self, label="Speed %")
+        self.wait = wx.SpinCtrlDouble(self, min=0, max=3600, inc=0.5, initial=float(step.get("wait", 0.0)))
+        self.wait.SetToolTip("Seconds to wait after this step (paused time does not count)")
+
+        if step.get("pose") in self.pose.GetStrings():
+            self.pose.SetStringSelection(step["pose"])
+        elif self.pose.GetCount():
+            self.pose.SetSelection(0)
+        ids = [tid for tid, _ in self.targets]
+        if step.get("target") in ids:
+            self.target.SetSelection(ids.index(step["target"]))
+        elif ids:
+            self.target.SetSelection(0)
+        linear = step.get("move") == "linear"
+        self.move.SetSelection(1 if linear else 0)
+        self.position_only.SetValue(bool(step.get("position_only")))
+        self._captured = dict(step.get("positions", {})) if step.get("type") == "joints" else None
+        self.update()
+        speed = float(step.get("speed", 0.1 if linear else 0.5))
+        self.speed.SetValue(speed * 1000 if linear and step.get("type") == "target" else speed * 100)
+
+        grid = wx.FlexGridSizer(cols=2, vgap=GAP, hgap=6)
+        grid.AddGrowableCol(1, 1)
+        for label, ctrl in [("Pose", self.pose), ("Target", self.target), ("Move", self.move),
+                            ("", self.position_only), (self.speed_label, self.speed), ("Wait s", self.wait)]:
+            grid.Add(label if isinstance(label, wx.Window) else wx.StaticText(self, label=label),
+                     0, wx.ALIGN_CENTER_VERTICAL)
+            grid.Add(ctrl, 1, wx.EXPAND)
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(self.kind, 0, wx.EXPAND | wx.ALL, GAP * 2)
+        s.Add(grid, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, GAP * 2)
+        s.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.EXPAND | wx.ALL, GAP * 2)
+        self.SetSizerAndFit(s)
+        self.Bind(wx.EVT_BUTTON, self.on_ok, id=wx.ID_OK)
+
+    @property
+    def kind_key(self) -> str:
+        return STEP_KINDS[self.kind.GetSelection()][0]
+
+    def update(self) -> None:
+        kind = self.kind_key
+        linear = kind == "target" and self.move.GetSelection() == 1
+        self.pose.Enable(kind == "pose")
+        for w in (self.target, self.move, self.position_only):
+            w.Enable(kind == "target")
+        old_linear = self.speed_label.GetLabel().startswith("TCP")
+        if linear != old_linear:
+            self.speed_label.SetLabel("TCP mm/s" if linear else "Speed %")
+            self.speed.SetRange(1, 2000 if linear else 100)
+            self.speed.SetValue(100 if linear else 50)
+            self.speed.SetToolTip("TCP speed along the line (joints slow it down where needed)" if linear
+                                  else "Percent of each joint's max velocity")
+
+    def on_ok(self, event: wx.CommandEvent) -> None:
+        kind = self.kind_key
+        if kind == "pose" and self.pose.GetSelection() < 0:
+            wx.MessageBox("Save a pose first (Poses tab).", "Motion step", wx.OK | wx.ICON_WARNING, self)
+            return
+        if kind == "target" and self.target.GetSelection() < 0:
+            wx.MessageBox("Create a target first (Tool & Targets tab).", "Motion step", wx.OK | wx.ICON_WARNING, self)
+            return
+        if kind == "target" and self.scope.get("kind") != "chain":
+            wx.MessageBox("A TCP target needs a chain scope: pick a saved chain in Scope first.", "Motion step",
+                          wx.OK | wx.ICON_WARNING, self)
+            return
+        if kind == "joints" and self._captured is None:
+            try:
+                joints = self.b.motion.scope_joints(self.scope)
+            except Exception as exc:
+                wx.MessageBox(str(exc), "Motion step", wx.OK | wx.ICON_WARNING, self)
+                return
+            self._captured = {n: self.b.positions[n] for n in joints if n in self.b.positions}
+        event.Skip()
+
+    def step(self) -> Dict[str, Any]:
+        kind = self.kind_key
+        out: Dict[str, Any] = {"type": kind, "wait": round(self.wait.GetValue(), 3)}
+        linear = kind == "target" and self.move.GetSelection() == 1
+        out["speed"] = round(self.speed.GetValue() / (1000.0 if linear else 100.0), 4)
+        if kind == "pose":
+            out["pose"] = self.pose.GetStringSelection()
+        elif kind == "joints":
+            out["positions"] = {k: round(v, 6) for k, v in (self._captured or {}).items()}
+        else:
+            tid, label = self.targets[self.target.GetSelection()]
+            out.update(target=tid, label=label, move="linear" if linear else "joint",
+                       position_only=self.position_only.GetValue())
+        return out
+
+
+class MotionTab(wx.ScrolledWindow):
+    """Motion programs (steps run automatically, with pause / resume / stop / step / loop) on a scope - all joints,
+    a group, a chain or one joint - and the external motion planner stream."""
+
+    def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
+        super().__init__(parent, style=wx.VSCROLL)
+        self.SetScrollRate(0, self.FromDIP(10))
+        self.frame = frame
+        self.b = frame.backend
+        self.steps: List[Dict[str, Any]] = []
+        self.scopes: List[Dict[str, Any]] = []
+
+        # program + scope
+        prog_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Program")
+        sb = prog_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.program = wx.Choice(sb, size=(self.FromDIP(170), -1), choices=[NEW_PROGRAM])
+        self.program.SetSelection(0)
+        self.program.Bind(wx.EVT_CHOICE, lambda e: self.load_program())
+        row.Add(self.program, 0, wx.RIGHT, 6)
+        for label, handler, tip in [("Save…", self.save_program, "Save the steps, scope and loop under a name"),
+                                    ("Delete", self.delete_program, "Delete the selected program")]:
+            btn = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(btn, 0, wx.RIGHT, GAP)
+        prog_box.Add(row, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.scope = wx.Choice(sb, size=(self.FromDIP(170), -1))
+        self.scope.SetToolTip("Joints this motion owns: all, a group, a saved chain (needed for TCP targets) or one "
+                              "joint. Other joints stay free for jogging or their own motion.")
+        self.loop = wx.CheckBox(sb, label="Loop")
+        self.loop.SetToolTip("Start again at step 1 after the last step, until Stop")
+        self.blend = wx.CheckBox(sb, label="Smooth")
+        self.blend.SetValue(True)
+        self.blend.SetToolTip("Pass through the steps without stopping (one continuous move; the robot only slows "
+                              "where a joint turns back). Steps with a wait still stop there.\n"
+                              "Off: stop at every step.")
+        row.Add(wx.StaticText(sb, label="Scope"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        row.Add(self.scope, 0, wx.RIGHT, 10)
+        row.Add(self.loop, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        row.Add(self.blend, 0, wx.ALIGN_CENTER_VERTICAL)
+        prog_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        self.list = wx.ListCtrl(sb, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list.SetMinSize(self.FromDIP(wx.Size(-1, 150)))
+        for i, (title, width) in enumerate([("#", 28), ("Step", 190), ("Move", 60), ("Speed", 70), ("Wait", 45)]):
+            self.list.InsertColumn(i, title, width=self.FromDIP(width))
+        self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, lambda e: self.edit_step())
+        prog_box.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, tip in [("Add…", self.add_step, "Add a step after the selected one"),
+                                    ("Edit…", self.edit_step, "Edit the selected step (or double-click it)"),
+                                    ("Remove", self.remove_step, "Remove the selected step"),
+                                    ("▲", lambda: self.move_step(-1), "Move the selected step up"),
+                                    ("▼", lambda: self.move_step(+1), "Move the selected step down")]:
+            btn = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(btn, 0, wx.RIGHT, GAP)
+        prog_box.Add(row, 0, wx.ALL, GAP)
+
+        # run controls
+        run_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Run")
+        sb = run_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler, tip in [
+                ("▶ Run", lambda: self.run(0), "Run the program from step 1"),
+                ("Run from selected", lambda: self.run(self.selected_index() or 0), "Run from the selected step"),
+                ("Step", lambda: self.run(self.selected_index() or 0, single=True), "Run only the selected step"),
+                ("Pause", lambda: self.frame.run(self.b.motion.pause(), what="pause"),
+                 "Pause the program and the planner stream (they slow down to a halt and hold)"),
+                ("Resume", lambda: self.frame.run(self.b.motion.resume(), what="resume"), "Continue"),
+                ("■ Stop", lambda: self.frame.run(self.b.motion.stop(), what="stop"),
+                 "Stop the program and the planner stream")]:
+            btn = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(btn, 0, wx.RIGHT, GAP)
+        run_box.Add(row, 0, wx.ALL, GAP)
+        self.status = wx.StaticText(sb, label="idle")
+        run_box.Add(self.status, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        # external planner
+        plan_box = wx.StaticBoxSizer(wx.VERTICAL, self, "External motion planner")
+        sb = plan_box.GetStaticBox()
+        self.planner_text = wx.StaticText(sb, label="")
+        self.planner_text.SetToolTip("A planner program connects here and sends joint poses (e.g. one per frame). "
+                                     "See examples/planner_example.py.")
+        plan_box.Add(self.planner_text, 0, wx.EXPAND | wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.planner_speed = wx.SpinCtrl(sb, min=5, max=100, initial=100, size=(self.FromDIP(56), -1))
+        self.planner_speed.SetToolTip("Max joint speed while following, in % of each joint's max velocity")
+        row.Add(wx.StaticText(sb, label="Speed %"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
+        row.Add(self.planner_speed, 0, wx.RIGHT, 8)
+        for label, handler, tip in [("Follow planner", self.follow, "Drive the scope's joints from the planner's poses"),
+                                    ("Stop following", lambda: self.frame.run(self.b.motion.stop_following(),
+                                                                              what="planner"),
+                                     "Stop forwarding planner poses (the joints slow down to a halt)")]:
+            btn = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(btn, 0, wx.RIGHT, GAP)
+        plan_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(prog_box, 1, wx.EXPAND | wx.ALL, GAP)
+        s.Add(run_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        s.Add(plan_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.SetSizer(s)
+        self.b.motion.on_status = self.show_status
+        self.timer = wx.Timer(self)                    # planner counters change without status events
+        self.Bind(wx.EVT_TIMER, lambda e: self.show_planner(), self.timer)
+        self.timer.Start(1000)
+        self.show_planner()
+
+    # data
+
+    @property
+    def scope_value(self) -> Dict[str, Any]:
+        i = self.scope.GetSelection()
+        return dict(self.scopes[i]) if 0 <= i < len(self.scopes) else {"kind": "all"}
+
+    def current_program(self) -> Dict[str, Any]:
+        return {"scope": self.scope_value, "steps": [dict(s) for s in self.steps], "loop": self.loop.GetValue(),
+                "blend": self.blend.GetValue()}
+
+    def robot_changed(self) -> None:
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Re-read scopes and programs (groups / chains may have changed in the other tabs)."""
+        current = self.scope_value
+        try:
+            self.scopes = self.b.motion.scopes()
+        except Exception:
+            self.scopes = []
+        from .motion import scope_label
+        self.scope.Set([scope_label(s) for s in self.scopes])
+        if current in self.scopes:
+            self.scope.SetSelection(self.scopes.index(current))
+        elif self.scopes:
+            self.scope.SetSelection(0)
+        name = self.program.GetStringSelection()
+        names = sorted(self.b.motion.programs()) if self.b.robot is not None else []
+        self.program.Set([NEW_PROGRAM] + names)
+        self.program.SetStringSelection(name if name in names else NEW_PROGRAM)
+
+    def fill_list(self, select: Optional[int] = None) -> None:
+        self.list.DeleteAllItems()
+        for i, step in enumerate(self.steps):
+            linear = step.get("type") == "target" and step.get("move") == "linear"
+            row = self.list.InsertItem(i, str(i + 1))
+            self.list.SetItem(row, 1, self.b.motion.step_label(step))
+            self.list.SetItem(row, 2, ("linear" if linear else "joint") if step.get("type") == "target" else "joint")
+            speed = float(step.get("speed", 0.5))
+            self.list.SetItem(row, 3, f"{speed * 1000:g} mm/s" if linear else f"{speed * 100:g} %")
+            self.list.SetItem(row, 4, f"{float(step.get('wait', 0)):g} s" if step.get("wait") else "")
+        if select is not None and 0 <= select < len(self.steps):
+            self.list.Select(select)
+            self.list.EnsureVisible(select)
+
+    def selected_index(self) -> Optional[int]:
+        i = self.list.GetFirstSelected()
+        return i if i >= 0 else None
+
+    # programs
+
+    def load_program(self) -> None:
+        name = self.program.GetStringSelection()
+        if name == NEW_PROGRAM:
+            self.steps = []
+            self.loop.SetValue(False)
+            self.blend.SetValue(True)
+        else:
+            p = self.b.motion.programs().get(name, {})
+            self.steps = [dict(s) for s in p.get("steps", [])]
+            self.loop.SetValue(bool(p.get("loop")))
+            self.blend.SetValue(bool(p.get("blend", True)))
+            scope = p.get("scope") or {"kind": "all"}
+            if scope in self.scopes:
+                self.scope.SetSelection(self.scopes.index(scope))
+            else:
+                self.frame.log(f"program '{name}': its scope {scope} no longer exists - pick one")
+        self.fill_list()
+
+    def save_program(self) -> None:
+        if self.b.data_dir is None:
+            self.frame.log("motion: no data folder - programs cannot be saved")
+            return
+        current = self.program.GetStringSelection()
+        name = self.frame.ask_name("Save program", "Program name:", set(self.b.motion.programs()),
+                                   "" if current == NEW_PROGRAM else current)
+        if name is None:
+            return
+        try:
+            self.b.motion.save_program(name, self.current_program())
+        except Exception as exc:
+            self.frame.log(f"save program: {exc}")
+            return
+        self.frame.log(f"saved program '{name}' ({len(self.steps)} steps)")
+        self.refresh()
+        self.program.SetStringSelection(name)
+
+    def delete_program(self) -> None:
+        name = self.program.GetStringSelection()
+        if name == NEW_PROGRAM:
+            return
+        if wx.MessageBox(f"Delete program '{name}'?", "Motion", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+                         self) != wx.YES:
+            return
+        self.b.motion.delete_program(name)
+        self.frame.log(f"deleted program '{name}'")
+        self.refresh()
+        self.load_program()
+
+    # steps
+
+    def add_step(self) -> None:
+        with StepDialog(self, self.frame, self.scope_value) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            step = dlg.step()
+        i = self.selected_index()
+        at = len(self.steps) if i is None else i + 1
+        self.steps.insert(at, step)
+        self.fill_list(at)
+
+    def edit_step(self) -> None:
+        i = self.selected_index()
+        if i is None:
+            return
+        with StepDialog(self, self.frame, self.scope_value, self.steps[i]) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            self.steps[i] = dlg.step()
+        self.fill_list(i)
+
+    def remove_step(self) -> None:
+        i = self.selected_index()
+        if i is not None:
+            del self.steps[i]
+            self.fill_list(min(i, len(self.steps) - 1))
+
+    def move_step(self, delta: int) -> None:
+        i = self.selected_index()
+        if i is None or not 0 <= i + delta < len(self.steps):
+            return
+        self.steps[i], self.steps[i + delta] = self.steps[i + delta], self.steps[i]
+        self.fill_list(i + delta)
+
+    # running
+
+    def run(self, start: int, single: bool = False) -> None:
+        self.frame.run(self.b.motion.run(self.current_program(), start, single), what="motion")
+
+    def follow(self) -> None:
+        self.frame.run(self.b.motion.follow(self.scope_value, self.planner_speed.GetValue() / 100.0),
+                       what="planner")
+
+    def show_status(self, status: Dict[str, Any]) -> None:
+        state, step, steps = status.get("state"), status.get("step"), status.get("steps", 0)
+        text = state or "idle"
+        if state != "idle" and step is not None:
+            text += f" · step {step + 1}/{steps}" + (f" · loop {status['loop'] + 1}" if status.get("loop") else "")
+            if self.list.GetItemCount() > step and self.selected_index() != step:
+                self.list.Select(step)
+                self.list.EnsureVisible(step)
+        if status.get("message"):
+            text += f"  -  {status['message']}"
+        self.status.SetLabel(text)
+        self.show_planner()
+
+    def show_planner(self) -> None:
+        p = self.b.motion.planner_status()
+        if not p["url"]:
+            self.planner_text.SetLabel("Planner endpoint not available (see the log)")
+            return
+        text = f"{p['url']}  ·  {p['clients']} connected"
+        if p["following"]:
+            text += f"  ·  following on {', '.join(p['scope'])}  ·  {p['poses']} poses"
+        self.planner_text.SetLabel(text)
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 
 class ToolboxFrame(wx.Frame):
@@ -1315,8 +1717,15 @@ class ToolboxFrame(wx.Frame):
         self.robot_ids: List[str] = []
         self.log_lines: List[str] = []
         self.log_frame: Optional[LogFrame] = None
+        self.keep_unity = False
+        self._unity_handed = False
+        self._unity_last_note = ""
+        self.unity_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda e: self.keep_unity_tick(), self.unity_timer)
         self._build_menu()
         self._build_ui()
+        if unity_focus.AVAILABLE and wx.Config.Get().ReadBool("keep_unity_in_front", False):
+            self.set_keep_unity(True, save=False)
         self.CreateStatusBar(2)
         self.SetStatusWidths([-3, -2])
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -1344,6 +1753,11 @@ class ToolboxFrame(wx.Frame):
         m = wx.Menu()
         self.log_item = m.AppendCheckItem(wx.ID_ANY, "&Log window\tCtrl+L")
         self.Bind(wx.EVT_MENU, lambda e: self.toggle_log(), self.log_item)
+        if unity_focus.AVAILABLE:
+            self.unity_item = m.AppendCheckItem(
+                wx.ID_ANY, "Keep &Unity in front\tCtrl+U",
+                "Toolbox on top; while the robot moves, focus goes back to Unity so the Editor runs at full speed")
+            self.Bind(wx.EVT_MENU, lambda e: self.set_keep_unity(self.unity_item.IsChecked()), self.unity_item)
         bar.Append(m, "&View")
         m = wx.Menu()
         self.Bind(wx.EVT_MENU, self.on_describe, m.Append(wx.ID_ANY, "&Describe && save\tCtrl+D"))
@@ -1384,9 +1798,14 @@ class ToolboxFrame(wx.Frame):
         self.jog = JogTab(self.book, self)
         self.poses = PosesTab(self.book, self)
         self.cart = CartesianTab(self.book, self)
+        self.motion = MotionTab(self.book, self)
         self.book.AddPage(self.jog, "Joint jog")
         self.book.AddPage(self.poses, "Poses")
         self.book.AddPage(self.cart, "Tool && Targets")
+        self.book.AddPage(self.motion, "Motion")
+        # groups, chains, poses and targets change in the other tabs: re-read them when Motion is shown
+        self.book.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED,
+                       lambda e: (self.book.GetCurrentPage() is self.motion and self.motion.refresh(), e.Skip()))
 
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(head, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 6)
@@ -1402,6 +1821,62 @@ class ToolboxFrame(wx.Frame):
         if self.log_frame is not None:
             self.log_frame.append(text)
         self.SetStatusText(text, 0)
+
+    # ── keep Unity in front ──────────────────────────────────────────────────
+    # The Unity Editor runs only about one frame every 2 s while it is not focused, so the robot moves in jumps while
+    # the Toolbox has focus. With this option the Toolbox stays on top, and while the robot moves and the user has
+    # left the mouse and keyboard alone for a moment, the focus goes back to Unity (see unity_focus.py).
+
+    def set_keep_unity(self, on: bool, save: bool = True) -> None:
+        self.keep_unity = on
+        self.unity_item.Check(on)
+        style = self.GetWindowStyle()
+        self.SetWindowStyle(style | wx.STAY_ON_TOP if on else style & ~wx.STAY_ON_TOP)
+        if on:
+            self.unity_timer.Start(200)
+            if unity_focus.find_unity_window() is None:
+                self.log("Keep Unity in front: no Unity window found yet (it is looked up again while the robot moves)")
+        else:
+            self.unity_timer.Stop()
+        if save:
+            wx.Config.Get().WriteBool("keep_unity_in_front", on)
+            wx.Config.Get().Flush()
+
+    def robot_moving(self) -> bool:
+        b = self.backend
+        return bool(b.running_goals()) or b.motion.running or b.motion.planner_status()["following"]
+
+    def keep_unity_tick(self) -> None:
+        """While the robot moves: once the user leaves the Toolbox alone, hand the focus to Unity."""
+        try:
+            moving = self.keep_unity and self.robot_moving()
+            if not moving:
+                self._unity_handed = False              # log the next hand-off again
+                return
+            if not unity_focus.foreground_is(self.GetHandle()):       # Unity already, another app, or a dialog
+                return
+            if unity_focus.mouse_button_down() or unity_focus.seconds_since_input() < unity_focus.IDLE_BEFORE_FOCUS:
+                return
+            robot = self.backend.robot
+            names = [robot.project, robot.stage] if robot is not None else []
+            hwnd = unity_focus.find_unity_window(names)
+            if not hwnd:
+                self._unity_note("Keep Unity in front: no Unity window found")
+                return
+            if unity_focus.focus(hwnd):
+                if not self._unity_handed:
+                    self._unity_handed = True
+                    self.log(f"Keep Unity in front: focus → {unity_focus.window_title(hwnd)[:60]}")
+            else:
+                self._unity_note("Keep Unity in front: Windows refused to switch to Unity - click into Unity instead")
+        except Exception as exc:                        # never let the timer die silently
+            self._unity_note(f"Keep Unity in front: {exc or type(exc).__name__}")
+
+    def _unity_note(self, text: str) -> None:
+        """Log a hand-off problem once per motion."""
+        if text != self._unity_last_note:
+            self._unity_last_note = text
+            self.log(text)
 
     def toggle_log(self) -> None:
         if self.log_frame is None:
@@ -1507,6 +1982,7 @@ class ToolboxFrame(wx.Frame):
         self.jog.build(list(robot.joints))
         self.jog.refresh_groups()
         self.cart.robot_changed()
+        self.motion.robot_changed()
         self.poses.refresh()
         self.Layout()
 

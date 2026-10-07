@@ -70,6 +70,10 @@ namespace RobotMarket.RemoteControl
             public string PauseReason;
             public int NextPoint;
             public double SinceFeedback;
+            public double[] LastCommanded;      // stream goals: where the joints were sent last tick
+            public double[] StreamTarget;       // stream goals: the newest streamed pose
+            public bool StreamEnd;              // stream goals: no more poses will come
+            public int StreamCount;
 
             // on_busy "parallel": may run next to goals on other joints; other modes run only when idle
             public bool Parallel => Spec.OnBusy == "parallel";
@@ -175,8 +179,29 @@ namespace RobotMarket.RemoteControl
                 case MsgType.Resume: Ack(env, Resume(env.GoalId)); break;
                 case MsgType.Cancel: Ack(env, Cancel(env.GoalId)); break;
                 case MsgType.Stop: Ack(env, Stop()); break;
+                case MsgType.Stream: OnStream(env); break;     // no ack: streams arrive at frame rate
             }
             PublishState();
+        }
+
+        /// <summary>The newest pose for a stream goal (running or still queued); poses for unknown goals are dropped.</summary>
+        void OnStream(Envelope env)
+        {
+            var g = FindActive(env.GoalId) ?? _queue.FirstOrDefault(q => q.Id == env.GoalId);
+            if (g == null || !g.Spec.Stream || g.EndStatus != null) return;
+            if (env.Payload["positions"] is JArray arr && arr.Count == g.Spec.JointNames.Length)
+            {
+                try
+                {
+                    var target = new double[arr.Count];
+                    for (int j = 0; j < arr.Count; j++)
+                        target[j] = GoalParser.ClampToLimits(_joints[g.Spec.JointNames[j]], arr[j].Value<double>());
+                    g.StreamTarget = target;
+                    g.StreamCount++;
+                }
+                catch (Exception) { }
+            }
+            if (env.Payload["end"]?.Type == JTokenType.Boolean && env.Payload["end"].Value<bool>()) g.StreamEnd = true;
         }
 
         void Ack(Envelope env, (bool ok, string message) r) =>
@@ -327,6 +352,13 @@ namespace RobotMarket.RemoteControl
         {
             var pos = _driver.ReadPositions();
             var start = g.Spec.JointNames.Select(n => pos[n]).ToArray();
+            if (g.Spec.Stream)                  // no trajectory: hold here until the first streamed pose
+            {
+                g.LastCommanded = start;
+                if (g.StreamTarget == null) g.StreamTarget = (double[])start.Clone();
+                _actives.Add(g);
+                return true;
+            }
             try
             {
                 GoalParser.CheckSegmentSpeed(g.Spec.JointNames, _joints, start, g.Spec.Positions[0], g.Spec.Times[0], "start→point 0");
@@ -356,14 +388,64 @@ namespace RobotMarket.RemoteControl
             PublishState();
         }
 
-        /// <summary>Advance one goal; true when it has ended.</summary>
-        bool TickGoal(Goal g, double dt)
+        /// <summary>Ramp the goal's time scale towards its target; returns the mean rate over this tick.</summary>
+        double Ramp(Goal g, double dt)
         {
-            // Ramp the time scale towards its target, integrating time with the mean rate
             double step = dt / DecelTime, r0 = g.Rate;
             if (g.Rate < g.TargetRate) g.Rate = Math.Min(g.TargetRate, g.Rate + step);
             else if (g.Rate > g.TargetRate) g.Rate = Math.Max(g.TargetRate, g.Rate - step);
-            g.Time = Math.Min(g.Traj.Duration, g.Time + dt * 0.5 * (r0 + g.Rate));
+            return 0.5 * (r0 + g.Rate);
+        }
+
+        /// <summary>A stream goal: move each joint towards the newest streamed pose, at most rate × speed × max_velocity,
+        /// so a jump in the stream becomes a fast but limited move, and pause / cancel / stop slow it to a halt.</summary>
+        bool TickStream(Goal g, double dt)
+        {
+            double meanRate = Ramp(g, dt);
+            g.Time += dt * meanRate;
+            var target = g.StreamTarget ?? g.LastCommanded;
+            var cmd = new double[g.LastCommanded.Length];
+            var targets = new Dictionary<string, double>();
+            bool there = true;
+            for (int j = 0; j < cmd.Length; j++)
+            {
+                var vmax = _joints[g.Spec.JointNames[j]].MaxVelocity;
+                double limit = (vmax.HasValue && vmax.Value > 0 ? vmax.Value * g.Spec.StreamSpeed : double.PositiveInfinity) * meanRate * dt;
+                double delta = target[j] - g.LastCommanded[j];
+                cmd[j] = g.LastCommanded[j] + Math.Max(-limit, Math.Min(limit, delta));
+                targets[g.Spec.JointNames[j]] = cmd[j];
+                if (Math.Abs(target[j] - cmd[j]) >= 1e-9) there = false;
+            }
+            g.LastCommanded = cmd;
+            _driver.WriteTargets(targets);
+            if (g.Spec.ReportsProgress)
+            {
+                g.SinceFeedback += dt;
+                if (g.SinceFeedback >= 1.0 / g.Spec.ProgressHz)
+                {
+                    g.SinceFeedback = 0;
+                    SendFeedback(g);
+                }
+            }
+            if (g.EndStatus != null && g.Rate == 0)
+            {
+                Finish(g, g.EndStatus, g.EndMessage);
+                return true;
+            }
+            if (g.StreamEnd && there)
+            {
+                Finish(g, GoalStatus.Succeeded, "stream ended");
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Advance one goal; true when it has ended.</summary>
+        bool TickGoal(Goal g, double dt)
+        {
+            if (g.Spec.Stream) return TickStream(g, dt);
+            // Ramp the time scale towards its target, integrating time with the mean rate
+            g.Time = Math.Min(g.Traj.Duration, g.Time + dt * Ramp(g, dt));
 
             var cmd = g.Traj.Sample(g.Time);
             var targets = new Dictionary<string, double>();
@@ -419,6 +501,16 @@ namespace RobotMarket.RemoteControl
 
         void SendFeedback(Goal g)
         {
+            if (g.Spec.Stream)
+            {
+                _emit(MsgType.Feedback, g.Id, new JObject
+                {
+                    ["state"] = g.State, ["stream"] = true, ["time"] = Math.Round(g.Time, 4),
+                    ["rate"] = Math.Round(g.Rate, 4), ["poses_received"] = g.StreamCount,
+                    ["positions"] = new JArray(Measured(g)),
+                });
+                return;
+            }
             _emit(MsgType.Feedback, g.Id, new JObject
             {
                 ["state"] = g.State,

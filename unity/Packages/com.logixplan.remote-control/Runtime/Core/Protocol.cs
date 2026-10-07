@@ -34,6 +34,7 @@ namespace RobotMarket.RemoteControl
         public const string Describe = "describe";
         public const string Visualize = "visualize";
         public const string Target = "target";
+        public const string Stream = "stream";      // the newest pose for a stream goal (no ack; sent at frame rate)
         // both
         public const string Heartbeat = "heartbeat";
     }

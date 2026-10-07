@@ -192,7 +192,7 @@ namespace RobotMarket.RemoteControl
             ["supports"] = new JObject
             {
                 ["pause"] = true, ["report_points"] = true, ["report_progress"] = true, ["pose_targets"] = false,
-                ["describe"] = true, ["parallel_goals"] = true, ["visualize"] = Visualizer != null, ["targets"] = TargetHandler != null,
+                ["describe"] = true, ["parallel_goals"] = true, ["stream"] = true, ["visualize"] = Visualizer != null, ["targets"] = TargetHandler != null,
             },
             ["instance"] = Instance,
             ["project"] = Project,

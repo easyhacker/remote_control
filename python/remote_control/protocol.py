@@ -37,6 +37,7 @@ class MsgType:
     DESCRIBE = "describe"
     VISUALIZE = "visualize"
     TARGET = "target"
+    STREAM = "stream"          # the newest pose for a stream goal (no ack; sent at frame rate)
     # both
     HEARTBEAT = "heartbeat"
 

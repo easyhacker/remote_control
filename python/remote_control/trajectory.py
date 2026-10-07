@@ -45,10 +45,14 @@ class GoalSpec:
     progress_hz: float = 10.0
     on_busy: str = "queue"
     interpolation: str = "cubic"
+    # Stream goals have no points: the controller sends `stream` messages with the newest pose, and the robot
+    # follows it every tick at up to stream_speed × each joint's max_velocity (see MotionExecutor._tick_stream).
+    stream: bool = False
+    stream_speed: float = 1.0
 
     @property
     def reports_points(self) -> bool:
-        return self.report in ("points", "all")
+        return self.report in ("points", "all") and not self.stream
 
     @property
     def reports_progress(self) -> bool:
@@ -66,8 +70,11 @@ def parse_goal(payload: Dict[str, Any], joints: Dict[str, Joint]) -> GoalSpec:
         if n not in joints:
             raise GoalError(f"unknown joint '{n}'")
 
+    stream = payload.get("stream", False) is True
     points = payload.get("points")
-    if not isinstance(points, list) or not points:
+    if stream:
+        points = []                  # a stream goal follows `stream` messages instead
+    elif not isinstance(points, list) or not points:
         raise GoalError("points must be a non-empty list")
     times: List[float] = []
     positions: List[List[float]] = []
@@ -108,7 +115,21 @@ def parse_goal(payload: Dict[str, Any], joints: Dict[str, Joint]) -> GoalSpec:
     except (TypeError, ValueError):
         raise GoalError("progress_hz must be a number")
     progress_hz = min(max(progress_hz, 0.5), 100.0)
-    return GoalSpec(names, times, positions, report, progress_hz, on_busy, interpolation)
+    try:
+        stream_speed = float(payload.get("speed", 1.0))
+    except (TypeError, ValueError):
+        raise GoalError("speed must be a number")
+    if stream and not 0.0 < stream_speed <= 1.0:
+        raise GoalError("speed must be in (0, 1]: the fraction of each joint's max_velocity")
+    return GoalSpec(names, times, positions, report, progress_hz, on_busy, interpolation, stream, stream_speed)
+
+
+def clamp_to_limits(joint: Joint, x: float) -> float:
+    if joint.lower is not None and x < joint.lower:
+        return joint.lower
+    if joint.upper is not None and x > joint.upper:
+        return joint.upper
+    return x
 
 
 def check_segment_speed(names: Sequence[str], joints: Dict[str, Joint], a: Sequence[float],

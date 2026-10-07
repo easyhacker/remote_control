@@ -376,6 +376,57 @@ class _Conformance:
             with self.assertRaises(PoseNotFound):
                 await self.robot.move_to_pose("ready")
 
+    async def wait_feedback(self, goal, check, timeout=3.0):
+        """Wait until the goal's latest feedback satisfies check(positions); return those positions."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            fb = goal.last_feedback
+            if fb and check(fb["positions"]):
+                return fb["positions"]
+            await asyncio.sleep(0.01)
+        self.fail(f"feedback never matched (last: {goal.last_feedback})")
+
+    async def test_stream_follows_newest_pose_within_max_velocity(self):
+        self.assertTrue(self.robot.supports.get("stream"))
+        g = await self.robot.stream(["shoulder"], progress_hz=50)
+        t0 = time.monotonic()
+        await g.send([2.0])
+        x = (await self.wait_feedback(g, lambda p: p[0] > 0.05))[0]
+        self.assertLess(x, 1.9)                                     # limited by max_velocity 4/s: not a jump
+        await self.wait_feedback(g, lambda p: abs(p[0] - 2.0) < 1e-3)
+        self.assertGreater(time.monotonic() - t0, 0.4)              # 2 rad at 4 rad/s
+        await g.send({"shoulder": -1.0}, end=True)                  # last pose, then the goal ends there
+        result = await g.result(timeout=3)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertAlmostEqual(result["positions"][0], -1.0, places=3)
+
+    async def test_stream_pauses_resumes_and_stops(self):
+        g = await self.robot.stream(["elbow"], progress_hz=50)
+        await g.send([1.5])
+        await self.wait_feedback(g, lambda p: p[0] > 0.1)
+        self.assertTrue((await g.pause())["ok"])
+        await self.wait_state("paused")
+        await asyncio.sleep(0.1)                                    # feedback sent after the halt
+        held = g.last_feedback["positions"][0]
+        await g.send([-1.5])                                        # poses still arrive while paused …
+        await asyncio.sleep(0.3)
+        self.assertAlmostEqual(g.last_feedback["positions"][0], held, places=3)   # … but the robot holds
+        self.assertTrue((await g.resume())["ok"])
+        await self.wait_feedback(g, lambda p: abs(p[0] + 1.5) < 1e-3)   # then follows the newest pose
+        self.assertTrue((await self.robot.stop())["ok"])
+        self.assertEqual((await g.result(timeout=3))["status"], "stopped")
+
+    async def test_stream_runs_in_parallel_with_other_goals(self):
+        g = await self.robot.stream(["shoulder"], on_busy="parallel", progress_hz=50)
+        b = await self.robot.execute(["slide"], [([0.3], 0.6)], on_busy="parallel")
+        self.assertEqual((g.queue_position, b.queue_position), (0, 0))
+        await g.send([1.0])
+        self.assertEqual((await b.result(timeout=3))["status"], "succeeded")
+        await g.end()
+        result = await g.result(timeout=3)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertAlmostEqual(result["positions"][0], 1.0, places=3)
+
     async def test_parallel_goals_on_different_joints(self):
         self.assertTrue(self.robot.supports.get("parallel_goals"))
         t0 = time.monotonic()

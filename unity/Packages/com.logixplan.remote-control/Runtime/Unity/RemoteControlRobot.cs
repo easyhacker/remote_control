@@ -163,6 +163,7 @@ namespace RobotMarket.RemoteControl.Unity
 
         void OnEnable()
         {
+            StartStallRecorders();
             ApplyCommandLine();
             if (articulationRoot == null) articulationRoot = FindArticulationRoot();
             if (articulationRoot == null)
@@ -319,7 +320,9 @@ namespace RobotMarket.RemoteControl.Unity
         {
             if (Session == null) return;
             double now = Time.realtimeSinceStartupAsDouble;
-            if (_lastStep > 0 && now - _lastStep > 1.0) ReportHitch(now - _lastStep, now);
+            // only stalls while the robot moves matter (an idle robot does not jerk)
+            if (_lastStep > 0 && now - _lastStep > 1.0 && Session.Executor.ActiveGoalIds.Count > 0)
+                ReportHitch(now - _lastStep, now);
             _lastStep = now;
             Session.Update(Time.fixedDeltaTime, now);
             _driver?.EndStep();
@@ -327,17 +330,68 @@ namespace RobotMarket.RemoteControl.Unity
 
         double _lastStep, _lastHitchLog = double.NegativeInfinity, _worstHitch;
         int _hitches;
+        string _worstBreakdown = "";
+
+        // Profiler markers read when Unity stalls, to say where the time went (the Editor records them without the
+        // Profiler window). Names that do not exist in this Unity version are skipped.
+        static readonly string[] StallMarkers =
+        {
+            "PlayerLoop", "EditorLoop", "FixedUpdate.PhysicsFixedUpdate", "Update.ScriptRunBehaviourUpdate",
+            "PreLateUpdate.ScriptRunBehaviourLateUpdate", "PostLateUpdate.FinishFrameRendering",
+            "Gfx.WaitForPresentOnGfxThread", "WaitForTargetFPS", "Application.Idle", "GUI.Repaint",
+            "EditorApplication.update", "Inspector.Repaint", "SceneView.Repaint", "GameView.Repaint",
+        };
+        List<(string name, global::Unity.Profiling.ProfilerRecorder rec)> _stallRecorders;
+
+        void StartStallRecorders()
+        {
+            _stallRecorders = new List<(string, global::Unity.Profiling.ProfilerRecorder)>();
+            var handles = new List<global::Unity.Profiling.LowLevel.Unsafe.ProfilerRecorderHandle>();
+            global::Unity.Profiling.LowLevel.Unsafe.ProfilerRecorderHandle.GetAvailable(handles);
+            foreach (var h in handles)
+            {
+                var name = global::Unity.Profiling.LowLevel.Unsafe.ProfilerRecorderHandle.GetDescription(h).Name;
+                if (Array.IndexOf(StallMarkers, name) >= 0 && _stallRecorders.All(r => r.name != name))
+                    _stallRecorders.Add((name, new global::Unity.Profiling.ProfilerRecorder(h, 1,
+                        global::Unity.Profiling.ProfilerRecorderOptions.Default)));
+            }
+            foreach (var r in _stallRecorders) r.rec.Start();
+        }
+
+        void StopStallRecorders()
+        {
+            if (_stallRecorders == null) return;
+            foreach (var r in _stallRecorders) r.rec.Dispose();
+            _stallRecorders = null;
+        }
+
+        /// <summary>Where the last (stalled) frame spent its time: markers above 50 ms, plus frame-rate settings.</summary>
+        string StallBreakdown()
+        {
+            var parts = new List<string>();
+            if (_stallRecorders != null)
+                foreach (var (name, rec) in _stallRecorders)
+                    if (rec.Valid && rec.LastValue > 50_000_000)        // nanoseconds
+                        parts.Add($"{name} {rec.LastValue / 1e9:0.00} s");
+            parts.Add($"targetFrameRate {Application.targetFrameRate}, vSync {QualitySettings.vSyncCount}, " +
+                      $"runInBackground {Application.runInBackground}, focused {Application.isFocused}");
+            return string.Join("; ", parts);
+        }
 
         /// <summary>Unity went a while without a physics step (slow render / Editor frame). The session keeps the
-        /// link alive from a background thread; motion just takes longer. Logged at most every 30 s.</summary>
+        /// link alive from a background thread; motion just takes longer. Logged at most every 30 s, with where the
+        /// worst stalled frame spent its time.</summary>
         void ReportHitch(double seconds, double now)
         {
             _hitches++;
+            if (seconds > _worstHitch) _worstBreakdown = StallBreakdown();
             _worstHitch = Math.Max(_worstHitch, seconds);
             if (now - _lastHitchLog < 30) return;
-            Debug.LogWarning($"[RemoteControl] Unity stalled {_hitches}x, up to {_worstHitch:0.0} s without a physics step " +
-                             "(slow rendering or Editor work - see Window > Analysis > Profiler). Motion slows down during " +
-                             "stalls; the connection is kept alive.", this);
+            Debug.LogWarning($"[RemoteControl] Unity stalled {_hitches}x while the robot moved, up to {_worstHitch:0.0} s " +
+                             "without a physics step. If 'focused False' below: the Editor throttles itself when it is not the " +
+                             "focused window - click into Unity, use the Toolbox's View > Keep Unity in front, or a built " +
+                             "player. Otherwise see Window > Analysis > Profiler. The connection is kept alive.\n" +
+                             $"Worst stall: {_worstBreakdown}", this);
             _lastHitchLog = now;
             _hitches = 0;
             _worstHitch = 0;
@@ -559,6 +613,7 @@ namespace RobotMarket.RemoteControl.Unity
 
         void OnDisable()
         {
+            StopStallRecorders();
             _markers?.Dispose();
             _markers = null;
             if (Session == null) return;

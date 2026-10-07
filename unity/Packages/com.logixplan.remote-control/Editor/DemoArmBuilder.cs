@@ -1,4 +1,5 @@
-// Menu: IVI Dynamic → Remote Control → Create Demo Arm / Create Demo Scene.
+// Builds the demo arm / scene. Menus hidden for now: call CreateDemoArmMenu / CreateDemoSceneMenu from code, or the
+// batch methods below (the release build uses BuildDemoPlayerBatch).
 // Builds a 5-joint arm (4 revolute + 1 prismatic gripper) from primitives with ArticulationBody joints and
 // a RemoteControlRobot component, ready to connect to examples/controller_demo.py.
 // Batch mode: Unity -batchmode -projectPath <proj> -executeMethod RobotMarket.RemoteControl.Editor.DemoArmBuilder.CreateDemoSceneBatch -quit
@@ -14,7 +15,7 @@ namespace RobotMarket.RemoteControl.Editor
     {
         const string ScenePath = "Assets/Scenes/RemoteControlDemo.unity";
 
-        [MenuItem("IVI Dynamic/Remote Control/Create Demo Arm")]
+        // menu hidden for now (only Enable Run In Background is in IVI Dynamic → Remote Control); was: [MenuItem("IVI Dynamic/Remote Control/Create Demo Arm")]
         public static void CreateDemoArmMenu()
         {
             var arm = CreateDemoArm();
@@ -22,7 +23,7 @@ namespace RobotMarket.RemoteControl.Editor
             Selection.activeGameObject = arm;
         }
 
-        [MenuItem("IVI Dynamic/Remote Control/Create Demo Scene")]
+        // menu hidden for now (only Enable Run In Background is in IVI Dynamic → Remote Control); was: [MenuItem("IVI Dynamic/Remote Control/Create Demo Scene")]
         public static void CreateDemoSceneMenu()
         {
             if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;

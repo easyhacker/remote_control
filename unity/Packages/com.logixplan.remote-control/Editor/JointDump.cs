@@ -1,4 +1,4 @@
-// Menu: IVI Dynamic → Remote Control → Debug: Dump Joints of Selection
+// Debug: Dump Joints of Selection (menu hidden for now; restore the [MenuItem] below to use it)
 // Writes the physics settings of every ArticulationBody under the selected object (mass, damping, friction,
 // velocity caps, drive gains and limits) plus the project physics settings to Logs/joint_dump.txt — for
 // diagnosing joints that lag, overshoot or don't move.
@@ -13,7 +13,7 @@ namespace RobotMarket.RemoteControl.Editor
 {
     public static class JointDump
     {
-        [MenuItem("IVI Dynamic/Remote Control/Debug: Dump Joints of Selection")]
+        // menu hidden for now (only Enable Run In Background is in IVI Dynamic → Remote Control); was: [MenuItem("IVI Dynamic/Remote Control/Debug: Dump Joints of Selection")]
         static void Dump()
         {
             var root = Selection.activeGameObject;

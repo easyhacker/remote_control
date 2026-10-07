@@ -41,8 +41,12 @@ namespace RobotMarket.RemoteControl
         public double ProgressHz = 10;
         public string OnBusy = "queue";
         public string Interpolation = "cubic";
+        // Stream goals have no points: the controller sends `stream` messages with the newest pose, and the robot
+        // follows it every tick at up to StreamSpeed × each joint's max_velocity (see MotionExecutor.TickStream).
+        public bool Stream;
+        public double StreamSpeed = 1.0;
 
-        public bool ReportsPoints => Report == "points" || Report == "all";
+        public bool ReportsPoints => (Report == "points" || Report == "all") && !Stream;
         public bool ReportsProgress => Report == "progress" || Report == "all";
     }
 
@@ -66,8 +70,9 @@ namespace RobotMarket.RemoteControl
             foreach (var n in names)
                 if (!joints.ContainsKey(n)) throw new GoalException($"unknown joint '{n}'");
 
-            var pointsTok = payload["points"] as JArray;
-            if (pointsTok == null || pointsTok.Count == 0)
+            bool stream = payload["stream"]?.Type == JTokenType.Boolean && payload["stream"].Value<bool>();
+            var pointsTok = stream ? new JArray() : payload["points"] as JArray;   // a stream goal follows `stream` messages
+            if (!stream && (pointsTok == null || pointsTok.Count == 0))
                 throw new GoalException("points must be a non-empty list");
 
             var times = new List<double>();
@@ -114,6 +119,7 @@ namespace RobotMarket.RemoteControl
                 Report = payload["report"]?.Value<string>() ?? "points",
                 OnBusy = payload["on_busy"]?.Value<string>() ?? "queue",
                 Interpolation = payload["interpolation"]?.Value<string>() ?? "cubic",
+                Stream = stream,
             };
             if (!ReportModes.Contains(spec.Report)) throw new GoalException("report must be one of " + string.Join(", ", ReportModes));
             if (!OnBusyModes.Contains(spec.OnBusy)) throw new GoalException("on_busy must be one of " + string.Join(", ", OnBusyModes));
@@ -124,7 +130,22 @@ namespace RobotMarket.RemoteControl
                 if (hz.Type != JTokenType.Float && hz.Type != JTokenType.Integer) throw new GoalException("progress_hz must be a number");
                 spec.ProgressHz = Math.Min(Math.Max(hz.Value<double>(), 0.5), 100.0);
             }
+            var speed = payload["speed"];
+            if (speed != null)
+            {
+                if (speed.Type != JTokenType.Float && speed.Type != JTokenType.Integer) throw new GoalException("speed must be a number");
+                spec.StreamSpeed = speed.Value<double>();
+            }
+            if (stream && !(spec.StreamSpeed > 0 && spec.StreamSpeed <= 1))
+                throw new GoalException("speed must be in (0, 1]: the fraction of each joint's max_velocity");
             return spec;
+        }
+
+        public static double ClampToLimits(Joint j, double x)
+        {
+            if (j.Lower.HasValue && x < j.Lower.Value) return j.Lower.Value;
+            if (j.Upper.HasValue && x > j.Upper.Value) return j.Upper.Value;
+            return x;
         }
 
         public static void CheckSegmentSpeed(IReadOnlyList<string> names, IReadOnlyDictionary<string, Joint> joints,

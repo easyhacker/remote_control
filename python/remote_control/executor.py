@@ -13,6 +13,10 @@ Several goals can run at once when they move different joints (on_busy="parallel
 right arm of a dual-arm robot); each one is paused / resumed / cancelled on its own, and stop ends them all.
 on_busy="queue" goals wait until the robot is idle, as before.
 
+Stream goals (execute with "stream": true, no points) follow poses the controller sends in `stream` messages, e.g. one
+per frame from an external motion planner: every tick the goal's joints move towards the newest pose, limited by
+max_velocity, and the goal is paused / cancelled / stopped like any other.
+
 The C# port (unity/.../Runtime/Core/MotionExecutor.cs) mirrors this file — keep them in step.
 """
 from __future__ import annotations
@@ -22,7 +26,7 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from .protocol import Envelope, GoalStatus, MsgType, RobotState
-from .trajectory import GoalError, GoalSpec, Joint, Trajectory, check_segment_speed, parse_goal
+from .trajectory import GoalError, GoalSpec, Joint, Trajectory, check_segment_speed, clamp_to_limits, parse_goal
 
 Emit = Callable[[str, Optional[str], Dict[str, Any]], None]
 
@@ -82,6 +86,9 @@ class _Goal:
         self.next_point = 0
         self.since_feedback = 0.0
         self.last_commanded: List[float] = []
+        self.stream_target: Optional[List[float]] = None   # stream goals: the newest streamed pose
+        self.stream_end = False                            # stream goals: no more poses will come
+        self.stream_count = 0
 
     @property
     def parallel(self) -> bool:
@@ -168,7 +175,25 @@ class MotionExecutor:
             self._ack(env, *self.cancel(env.goal_id))
         elif t == MsgType.STOP:
             self._ack(env, *self.stop())
+        elif t == MsgType.STREAM:
+            self._on_stream(env)        # no ack: streams arrive at frame rate
         self._publish_state()
+
+    def _on_stream(self, env: Envelope) -> None:
+        """The newest pose for a stream goal (running or still queued); poses for unknown goals are dropped."""
+        g = self._find_active(env.goal_id) or next((q for q in self.queue if q.id == env.goal_id), None)
+        if g is None or not g.spec.stream or g.end_status:
+            return
+        positions = env.payload.get("positions")
+        if isinstance(positions, list) and len(positions) == len(g.spec.joint_names):
+            try:
+                g.stream_target = [clamp_to_limits(self.joints[n], float(x))
+                                   for n, x in zip(g.spec.joint_names, positions)]
+                g.stream_count += 1
+            except (TypeError, ValueError):
+                pass
+        if env.payload.get("end") is True:
+            g.stream_end = True
 
     def _ack(self, env: Envelope, ok: bool, message: str) -> None:
         self.emit(MsgType.ACK, env.goal_id,
@@ -320,6 +345,12 @@ class MotionExecutor:
         spec = g.spec
         pos = self.driver.read_positions()
         start = [pos[n] for n in spec.joint_names]
+        if spec.stream:                 # no trajectory: hold here until the first streamed pose
+            g.last_commanded = start
+            if g.stream_target is None:
+                g.stream_target = list(start)
+            self.actives.append(g)
+            return True
         try:
             check_segment_speed(spec.joint_names, self.joints, start, spec.positions[0],
                                 spec.times[0], "start→point 0")
@@ -347,17 +378,49 @@ class MotionExecutor:
             self._start_ready()
         self._publish_state()
 
-    def _tick_goal(self, g: _Goal, dt: float) -> bool:
-        """Advance one goal; True when it has ended."""
-        assert g.traj is not None
-        # Ramp the time scale towards its target, integrating time with the mean rate
+    def _ramp(self, g: _Goal, dt: float) -> float:
+        """Ramp the goal's time scale towards its target; returns the mean rate over this tick."""
         step = dt / self.decel_time
         r0 = g.rate
         if g.rate < g.target_rate:
             g.rate = min(g.target_rate, g.rate + step)
         elif g.rate > g.target_rate:
             g.rate = max(g.target_rate, g.rate - step)
-        g.time = min(g.traj.duration, g.time + dt * 0.5 * (r0 + g.rate))
+        return 0.5 * (r0 + g.rate)
+
+    def _tick_stream(self, g: _Goal, dt: float) -> bool:
+        """A stream goal: move each joint towards the newest streamed pose, at most rate × speed × max_velocity, so
+        a jump in the stream becomes a fast but limited move, and pause / cancel / stop slow it down to a halt."""
+        mean_rate = self._ramp(g, dt)
+        g.time += dt * mean_rate
+        target = g.stream_target or g.last_commanded
+        cmd = []
+        for name, x, goal_x in zip(g.spec.joint_names, g.last_commanded, target):
+            vmax = self.joints[name].max_velocity
+            limit = (vmax * g.spec.stream_speed if vmax else float("inf")) * mean_rate * dt
+            cmd.append(x + max(-limit, min(limit, goal_x - x)))
+        g.last_commanded = cmd
+        self.driver.write_targets(dict(zip(g.spec.joint_names, cmd)))
+        if g.spec.reports_progress:
+            g.since_feedback += dt
+            if g.since_feedback >= 1.0 / g.spec.progress_hz:
+                g.since_feedback = 0.0
+                self._feedback(g)
+        if g.end_status and g.rate == 0:
+            self._finish(g, g.end_status, g.end_message)
+            return True
+        if g.stream_end and all(abs(a - b) < 1e-9 for a, b in zip(cmd, target)):
+            self._finish(g, GoalStatus.SUCCEEDED, "stream ended")
+            return True
+        return False
+
+    def _tick_goal(self, g: _Goal, dt: float) -> bool:
+        """Advance one goal; True when it has ended."""
+        if g.spec.stream:
+            return self._tick_stream(g, dt)
+        assert g.traj is not None
+        # Ramp the time scale towards its target, integrating time with the mean rate
+        g.time = min(g.traj.duration, g.time + dt * self._ramp(g, dt))
 
         cmd = g.traj.sample(g.time)
         g.last_commanded = cmd
@@ -397,6 +460,12 @@ class MotionExecutor:
                   {"point_index": index, "positions": measured, "max_error": err})
 
     def _feedback(self, g: _Goal) -> None:
+        if g.spec.stream:
+            self.emit(MsgType.FEEDBACK, g.id, {
+                "state": g.state, "stream": True, "time": round(g.time, 4), "rate": round(g.rate, 4),
+                "poses_received": g.stream_count, "positions": self._measured(g),
+            })
+            return
         assert g.traj is not None
         self.emit(MsgType.FEEDBACK, g.id, {
             "state": g.state, "point_index": min(g.next_point, len(g.spec.times) - 1),

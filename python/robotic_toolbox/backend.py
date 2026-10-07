@@ -29,6 +29,7 @@ from remote_control import (ConfigError, GoalHandle, MotionController, RobotHand
 from remote_control.kinematics import forward_kinematics
 
 from .ik import Chain, IkResult, pose_from_xyz_rpy, rpy_matrix, xyz_rpy_from_pose
+from .motion import MotionRunner
 
 Post = Callable[[Callable[[], None]], Any]
 
@@ -45,10 +46,12 @@ def describe_connector(section: Mapping[str, Any]) -> str:
 class Backend:
     POLL_PERIOD = 0.2          # s between position reads while a robot is connected
 
-    def __init__(self, post: Post, url: Optional[str] = None, data_dir: Optional[str] = None) -> None:
+    def __init__(self, post: Post, url: Optional[str] = None, data_dir: Optional[str] = None,
+                 planner_port: Optional[int] = None) -> None:
         self._post = post
         self._url = url
         self._data_dir = data_dir
+        self._planner_port = planner_port         # None: from the config (default 8770); 0: no planner endpoint
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.controller: Optional[MotionController] = None
         self.endpoint = ""
@@ -77,6 +80,7 @@ class Backend:
         self.on_state: Callable[[Dict[str, Any]], None] = lambda state: None
         self.on_selected: Callable[[Optional[str]], None] = lambda item_id: None   # picked in the robot's viewer
         self.on_edited: Callable[[Dict[str, Any]], None] = lambda payload: None    # moved in the robot's viewer
+        self.motion = MotionRunner(self)          # Motion tab: programs and the external planner endpoint
 
     # ── thread plumbing ──────────────────────────────────────────────────────
 
@@ -163,6 +167,11 @@ class Backend:
         self.controller.on("robot_online", lambda e: self._robot_event(e["robot_id"], True))
         self.controller.on("robot_offline", lambda e: self._robot_event(e["robot_id"], False))
         await self.controller.start()
+        # optional "planner": {"host": "127.0.0.1", "port": 8770} in the config; port 0 turns the endpoint off
+        planner = config.get("planner", {})
+        port = int(planner.get("port", 8770)) if self._planner_port is None else self._planner_port
+        if port:
+            await self.motion.start_planner_server(str(planner.get("host", "127.0.0.1")), port)
 
     async def _shutdown(self) -> None:
         if self._poll_task is not None:
@@ -171,6 +180,7 @@ class Backend:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        await self.motion.stop_planner_server()
         if self.controller:
             await self.controller.stop()
 

@@ -28,8 +28,7 @@ The connector, the codec and the joint driver are independent plug-ins. The moti
    setx RC_CONFIG_DIR D:\Dev\remote_control\config
    ```
    `config/remote_control.json` selects WebSocket on `localhost:8765`. Edit it to change the type or parameters.
-1. Open `unity/` in Unity 6 (6000.5.7f1). Open `Assets/Scenes/RemoteControlDemo.unity`, or in any scene use
-   **IVI Dynamic → Remote Control → Create Demo Arm**.
+1. Open `unity/` in Unity 6 (6000.5.7f1) and open `Assets/Scenes/RemoteControlDemo.unity`.
 2. Start a controller:
    ```bash
    cd python && python -m venv .venv && .venv/Scripts/pip install websockets
@@ -145,6 +144,38 @@ A wxPython controller with native widgets on Windows, macOS and Linux:
   now. *Check* tests reachability, *Move* goes there. Inverse kinematics runs in the Toolbox (numpy, damped least
   squares within the joint limits) on the kinematic tree from `describe`, so any robot that supports describe works.
   Collisions are not checked.
+- **Motion:** motion programs and the external motion planner. Each motion owns a **scope**: all joints, a group, a
+  saved chain or one joint. It moves only those joints, so other joints can be jogged, or run their own motion, at
+  the same time.
+  - **Programs:** a list of steps that run automatically. Run (from step 1 or from the selected step), Step (only
+    the selected one), Pause / Resume (the robot slows down to a halt and holds), Stop, and Loop. A step is one of:
+    - a saved **pose**, restricted to the scope's joints;
+    - the **current position**, captured when the step is added;
+    - a **TCP target** of the chain scope, with a joint move (IK at the target) or a **linear move**.
+
+    Each step has a speed (% of max velocity, or TCP mm/s for linear moves) and a wait. Programs are saved per robot
+    in `programs.json`.
+  - **Smooth** (on by default): consecutive steps are planned ahead and sent as one continuous move through all the
+    step positions. The robot passes through them without stopping, and slows down only where a joint turns back.
+    A step with a wait still stops there. With Smooth off, the robot stops at every step.
+  - **Linear moves:** the TCP follows a straight line, with orientation interpolated. IK is solved every 5 mm or 2°
+    from the previous solution, and timing slows down where a joint would exceed its max velocity. The step fails
+    before moving if the line leaves the reachable space or the arm would flip.
+  - **External planner:** a program connects to `ws://127.0.0.1:8770/planner` and sends joint poses, for example one
+    per frame. **Follow planner** forwards them to the robot as a stream goal on the scope (PROTOCOL.md `stream`):
+    the robot moves to the newest pose every tick, within each joint's max velocity. Pause / Resume / Stop work as
+    for programs.
+    - Messages: the planner sends `{"positions": {"<joint>": value, …}}` (optionally `"end": true`). It receives a
+      `hello` (robot, joints with limits, scope) and `state` messages with measured positions, about 30 per second.
+    - `examples/planner_example.py` sways the scope's joints in a sine wave.
+    - The address can be changed with `"planner": {"host": …, "port": …}` in `remote_control.json`; port 0 turns
+      the endpoint off.
+- **Keep Unity in front** (View menu, Ctrl+U, Windows): the Unity Editor runs only about one frame every 2 s while
+  it isn't the focused window, so a robot in the Editor moves in jumps while you work in the Toolbox. With this on,
+  the Toolbox stays on top. While the robot moves, once the mouse and keyboard have been idle for half a second,
+  focus goes back to the Unity window matching the robot's project and scene. It never switches while a mouse
+  button is held, while a dialog is open, or when another program is in front. Built players aren't throttled and
+  don't need it.
 - **Viewer:** robots with `supports.visualize` (Unity) draw the chain, the TCP and the frames. Clicking a frame in
   Unity's Game view, or selecting it in the Hierarchy, makes it the target in the Toolbox. TCPs and frames are stored
   in the robot's data folder (`chains.json` with each chain's TCP, `frames.json`).

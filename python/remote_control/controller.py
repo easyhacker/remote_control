@@ -84,6 +84,7 @@ class GoalHandle(_Events):
         self.reason: Optional[str] = None
         self.points_reached: List[Dict[str, Any]] = []
         self.last_feedback: Optional[Dict[str, Any]] = None
+        self.joint_names: List[str] = []
         self._decided: "asyncio.Future" = asyncio.get_event_loop().create_future()
         self._result: "asyncio.Future" = asyncio.get_event_loop().create_future()
 
@@ -102,6 +103,22 @@ class GoalHandle(_Events):
 
     async def result(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         return await asyncio.wait_for(asyncio.shield(self._result), timeout)
+
+    async def send(self, positions: Union[Sequence[float], Mapping[str, float]], end: bool = False) -> None:
+        """Stream goals: the newest pose (in joint_names order, or by name - names left out keep their last value).
+        The robot follows it within max_velocity. end=True: no more poses; the goal succeeds once there."""
+        if isinstance(positions, Mapping):
+            last = self._last_sent or [0.0] * len(self.joint_names)
+            positions = [float(positions.get(n, x)) for n, x in zip(self.joint_names, last)]
+        self._last_sent = [float(x) for x in positions]
+        await self.robot._send(MsgType.STREAM, {"positions": self._last_sent, **({"end": True} if end else {})},
+                               self.goal_id)
+
+    async def end(self) -> None:
+        """Stream goals: finish at the last pose sent."""
+        await self.robot._send(MsgType.STREAM, {"end": True}, self.goal_id)
+
+    _last_sent: Optional[List[float]] = None
 
     def _on(self, env: Envelope) -> None:
         p = env.payload
@@ -174,9 +191,29 @@ class RobotHandle(_Events):
                 positions, t = p
                 pts.append({"positions": list(positions), "time_from_start": t})
         goal = self.goal(goal_id or new_goal_id())
+        goal.joint_names = list(joint_names)
         await self._send(MsgType.EXECUTE, {
             "joint_names": list(joint_names), "points": pts, "report": report,
             "progress_hz": progress_hz, "on_busy": on_busy, "interpolation": interpolation,
+        }, goal.goal_id)
+        accepted = await asyncio.wait_for(asyncio.shield(goal._decided), timeout)
+        if not accepted:
+            raise GoalRejected(goal.goal_id, goal.reason or "")
+        return goal
+
+    async def stream(self, joint_names: Sequence[str], *, speed: float = 1.0, report: str = "progress",
+                     progress_hz: float = 10.0, on_busy: str = "queue", goal_id: Optional[str] = None,
+                     timeout: float = 5.0) -> GoalHandle:
+        """Start a stream goal on `joint_names`: then call goal.send(positions) as often as poses come (e.g. every
+        frame of a motion planner) and goal.end() when done; pause / resume / cancel / stop work as for any goal.
+        The robot moves towards the newest pose at up to speed × each joint's max_velocity. Needs supports.stream."""
+        if not self.supports.get("stream"):
+            raise RobotError(f"robot {self.robot_id} cannot follow streamed poses (supports.stream is false)")
+        goal = self.goal(goal_id or new_goal_id())
+        goal.joint_names = list(joint_names)
+        await self._send(MsgType.EXECUTE, {
+            "joint_names": list(joint_names), "stream": True, "speed": speed, "report": report,
+            "progress_hz": progress_hz, "on_busy": on_busy,
         }, goal.goal_id)
         accepted = await asyncio.wait_for(asyncio.shield(goal._decided), timeout)
         if not accepted:

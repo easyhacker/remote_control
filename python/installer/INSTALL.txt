@@ -1,0 +1,34 @@
+LogixPlan Robotic Toolbox - installation (Windows 10 / 11, 64-bit)
+===================================================================
+
+Install
+-------
+1. Unzip LogixPlan-RoboticToolbox-<version>-win64.zip anywhere.
+2. Double-click install.cmd in the unzipped folder.
+   - No administrator rights and no internet connection are needed: Python and all packages are in this folder.
+   - It installs to %LOCALAPPDATA%\Programs\LogixPlan\RoboticToolbox and takes under a minute.
+   - The window shows six steps and ends with "Installed LogixPlan Robotic Toolbox".
+
+Options (from a Command Prompt in the unzipped folder):
+   install.cmd -InstallDir D:\Apps\RoboticToolbox     install somewhere else
+   install.cmd -Port 9000                             the Toolbox's WebSocket port (default 8765)
+   install.cmd -Online                                download Python and the packages instead
+
+Use
+---
+Start menu > LogixPlan:
+   Robotic Toolbox          the Toolbox (also on the desktop)
+   Demo robot (Unity)       a simulated arm with graphics that connects to the Toolbox
+   Fake robot (demo)        a simulated arm without graphics (a console window)
+Start the Toolbox, then a robot: it appears in the robot list at the top of the Toolbox.
+
+Files
+-----
+   %LOCALAPPDATA%\LogixPlan\config\remote_control.json    connection settings (RC_CONFIG_DIR points here)
+   Documents\LogixPlan\data                                robot data: descriptions, poses, chains, groups
+A robot on another computer connects to ws://<this computer>:8765/motion (allow the port in Windows Firewall).
+
+Uninstall
+---------
+Settings > Apps > LogixPlan Robotic Toolbox > Uninstall, or Start menu > LogixPlan > Uninstall Robotic Toolbox.
+The config and the robot data are kept; run uninstall.cmd -RemoveData in the install folder to delete them too.

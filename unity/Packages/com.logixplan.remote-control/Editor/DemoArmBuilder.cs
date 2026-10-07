@@ -1,4 +1,4 @@
-// Menu: RobotMarket → Remote Control → Create Demo Arm / Create Demo Scene.
+// Menu: IVI Dynamic → Remote Control → Create Demo Arm / Create Demo Scene.
 // Builds a 5-joint arm (4 revolute + 1 prismatic gripper) from primitives with ArticulationBody joints and
 // a RemoteControlRobot component, ready to connect to examples/controller_demo.py.
 // Batch mode: Unity -batchmode -projectPath <proj> -executeMethod RobotMarket.RemoteControl.Editor.DemoArmBuilder.CreateDemoSceneBatch -quit
@@ -14,7 +14,7 @@ namespace RobotMarket.RemoteControl.Editor
     {
         const string ScenePath = "Assets/Scenes/RemoteControlDemo.unity";
 
-        [MenuItem("RobotMarket/Remote Control/Create Demo Arm")]
+        [MenuItem("IVI Dynamic/Remote Control/Create Demo Arm")]
         public static void CreateDemoArmMenu()
         {
             var arm = CreateDemoArm();
@@ -22,7 +22,7 @@ namespace RobotMarket.RemoteControl.Editor
             Selection.activeGameObject = arm;
         }
 
-        [MenuItem("RobotMarket/Remote Control/Create Demo Scene")]
+        [MenuItem("IVI Dynamic/Remote Control/Create Demo Scene")]
         public static void CreateDemoSceneMenu()
         {
             if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;
@@ -35,21 +35,18 @@ namespace RobotMarket.RemoteControl.Editor
             EditorApplication.Exit(0);
         }
 
-        /// <summary>Batch: build a Windows player of the demo scene to Builds/RemoteControlDemo/.
-        /// Run it with: RemoteControlDemo.exe -batchmode -nographics -controllerUrl ws://host:8765/motion</summary>
+        /// <summary>Batch: build a Windows player of the demo scene to Builds/RemoteControlDemo/, with IL2CPP
+        /// (add "-backend mono" for a quick Mono build). Run it with:
+        /// RemoteControlDemo.exe -batchmode -nographics -controllerUrl ws://host:8765/motion</summary>
         public static void BuildDemoPlayerBatch()
         {
             if (!System.IO.File.Exists(ScenePath)) CreateDemoScene();
-            PlayerSettings.runInBackground = true;
-            var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
-            {
-                scenes = new[] { ScenePath },
-                locationPathName = "Builds/RemoteControlDemo/RemoteControlDemo.exe",
-                target = BuildTarget.StandaloneWindows64,
-                options = BuildOptions.None,
-            });
-            Debug.Log("[RemoteControl] build: " + report.summary.result);
-            EditorApplication.Exit(report.summary.result == UnityEditor.Build.Reporting.BuildResult.Succeeded ? 0 : 1);
+            var args = System.Environment.GetCommandLineArgs();
+            int i = System.Array.IndexOf(args, "-backend");
+            var backend = i >= 0 && i + 1 < args.Length && args[i + 1] == "mono"
+                ? ScriptingImplementation.Mono2x : ScriptingImplementation.IL2CPP;
+            var result = PlayerBuilder.Build(new[] { ScenePath }, "Builds/RemoteControlDemo/RemoteControlDemo.exe", backend);
+            EditorApplication.Exit(result == UnityEditor.Build.Reporting.BuildResult.Succeeded ? 0 : 1);
         }
 
         static void CreateDemoScene()

@@ -6,7 +6,7 @@ and pause, resume, cancel or stop the motion at any time. The behaviour is the s
 
 - **Protocol**: [PROTOCOL.md](PROTOCOL.md). JSON envelopes, the goal lifecycle, timing and interruption rules, heartbeats.
 - **Controller (Python)**: [`python/remote_control`](python/remote_control). The API your code uses to drive robots.
-- **Robot client (Unity)**: [`unity/Packages/com.robotmarket.remote-control`](unity/Packages/com.robotmarket.remote-control).
+- **Robot client (Unity)**: [`unity/Packages/com.logixplan.remote-control`](unity/Packages/com.logixplan.remote-control).
   Drives any `ArticulationBody` robot (including URDF-imported ones).
 
 ```
@@ -29,7 +29,7 @@ The connector, the codec and the joint driver are independent plug-ins. The moti
    ```
    `config/remote_control.json` selects WebSocket on `localhost:8765`. Edit it to change the type or parameters.
 1. Open `unity/` in Unity 6 (6000.5.7f1). Open `Assets/Scenes/RemoteControlDemo.unity`, or in any scene use
-   **RobotMarket → Remote Control → Create Demo Arm**.
+   **IVI Dynamic → Remote Control → Create Demo Arm**.
 2. Start a controller:
    ```bash
    cd python && python -m venv .venv && .venv/Scripts/pip install websockets
@@ -165,16 +165,164 @@ The bridge runs on the ROS install's Python (3.8 on Windows Humble) and the Tool
 Robotic Toolbox (3.12) ⇄ WebSocket / MQTT ⇄ ros2_robot_bridge.py (3.8 + rclpy) ⇄ ros2_control robot
 ```
 
-### Cythonized build
+### Cythonized build (Windows)
 
-```bash
-.venv/Scripts/pip install cython setuptools       # plus a C compiler (Visual Studio Build Tools on Windows)
-.venv/Scripts/python tools/build_cython.py --test # → build/cython: compiled remote_control + robotic_toolbox, tests run on it
-cd build/cython && ../../.venv/Scripts/python -m robotic_toolbox
+`tools\build_cython.py` compiles every module of `remote_control` and `robotic_toolbox` into a native extension
+(`.pyd`). Only the `__init__.py` / `__main__.py` files stay Python. The output goes to `python\build\cython\`, which
+mirrors `python\`: the compiled packages, plus `tests\`, `examples\` and `tools\` copied as source. The Toolbox icon
+(`robotic_toolbox\resources\`) is copied with them.
+
+Needs Cython, setuptools and the Microsoft C compiler: install **Visual Studio Build Tools** with the
+**Desktop development with C++** workload. Then, in a Command Prompt or PowerShell:
+
+```bat
+cd D:\Dev\remote_control\python
+.venv\Scripts\pip install cython setuptools
 ```
 
-Each module becomes a native extension (`.pyd` / `.so`). Only the `__init__.py` / `__main__.py` files stay Python.
-Build with the same Python version that will run the app.
+**Build and test** (about 1 minute to build, 2 more for the tests):
+
+```bat
+cd D:\Dev\remote_control\python
+.venv\Scripts\python tools\build_cython.py --test
+```
+
+Each build replaces `build\cython\`. `--test` first checks that the compiled modules are the ones imported, then runs
+the same test suites as the source tree. Other options:
+
+```bat
+.venv\Scripts\python tools\build_cython.py
+.venv\Scripts\python tools\build_cython.py --keep-c
+```
+
+The first one builds only; `--keep-c` keeps the generated `.c` files (debugging).
+
+**Run the compiled Toolbox** (start the robot first, e.g. press Play in Unity):
+
+```bat
+cd D:\Dev\remote_control\python\build\cython
+..\..\.venv\Scripts\python -m robotic_toolbox
+```
+
+To check that the compiled modules are in use (prints a `.pyd` path, not `.py`):
+
+```bat
+cd D:\Dev\remote_control\python\build\cython
+..\..\.venv\Scripts\python -c "import robotic_toolbox.app as a; print(a.__file__)"
+```
+
+**Notes**
+- After changing the code, edit the source in `python\` and rebuild. `build\cython\` holds only compiled modules and is
+  replaced on every build.
+- The `.pyd` files only run on the Python version and bitness they were built with: `app.cp312-win_amd64.pyd` needs
+  64-bit Python 3.12 on Windows.
+- To hand the app to someone, copy the whole `build\cython\` folder. They need the same Python version with the
+  dependencies installed (`pip install websockets paho-mqtt wxPython numpy`).
+
+### Windows release and installer
+
+`tools\build_release.py` makes one zip that installs the Toolbox, the compiled Remote Control Python package and a
+Unity demo robot on a Windows PC, without administrator rights or internet access:
+
+```bat
+cd D:\Dev\remote_control\python
+.venv\Scripts\python tools\build_release.py --test
+```
+
+The result is `python\dist\LogixPlan-RoboticToolbox-<version>-win64.zip` (about 80 MB; 47 MB with `--no-unity`). It holds:
+
+| Folder / file | Contents |
+|---|---|
+| `install.cmd`, `install.ps1` | the installer (`INSTALL.txt` explains it for testers) |
+| `uninstall.cmd`, `uninstall.ps1` | copied into the install folder; also listed in Settings > Apps |
+| `python\python.<version>.nupkg` | Python itself: python.org's NuGet package, a complete Python with no installer or registry entries |
+| `wheels\remote_control-<version>-cp312-cp312-win_amd64.whl` | the compiled `remote_control` + `robotic_toolbox` packages (`.pyd` only) |
+| `wheels\*.whl` | websockets, paho-mqtt, wxPython, numpy, at the versions the tests ran with |
+| `robot\` | the Unity demo robot, built with IL2CPP |
+| `examples\` | `fake_robot.py`, `controller_demo.py`, `mini_mqtt_broker.py` … (source) |
+
+**Unity robot and IL2CPP.** IL2CPP converts the C# of a Unity *player* to C++ and compiles it to a native
+`GameAssembly.dll`, so the release holds no C# source and no .NET assemblies. It needs, once:
+Unity Hub > Installs > 6000.5.7f1 > Manage > Add modules > **Windows Build Support (IL2CPP)**, plus Visual Studio's
+C++ tools (already needed for Cython). Close any Unity editor that has `D:\Dev\remote_control\unity` open: the build
+runs Unity in batch mode on that project. To build your own robot project with IL2CPP, use the package's
+`PlayerBuilder.BuildBatch` (see the comment at the top of `Editor/PlayerBuilder.cs`). `Runtime/link.xml` keeps
+IL2CPP from stripping Newtonsoft.Json and MQTTnet.
+
+Options:
+
+```bat
+.venv\Scripts\python tools\build_release.py --no-unity
+.venv\Scripts\python tools\build_release.py --skip-cython --skip-unity-build
+.venv\Scripts\python tools\build_release.py --no-python
+.venv\Scripts\python tools\build_release.py --unity-source
+```
+
+- `--no-unity`: leave out the Unity robot, so Unity isn't needed.
+- `--skip-cython --skip-unity-build`: reuse the existing `build\cython` and Unity player.
+- `--no-python`: a smaller zip; `install.ps1` then downloads Python from nuget.org.
+- `--unity-source`: also ship the Unity package as C# source, for Unity users.
+
+The builder stops if the wheel contains Python sources or lacks a compiled module, if the Unity player is not an
+IL2CPP build, and it never copies IL2CPP's `*_BackUpThisFolder_ButDontShipItWithYourGame` folder (the generated C++).
+
+**What install.cmd does** (per user; see `installer\install.ps1`):
+
+1. It unpacks Python into `%LOCALAPPDATA%\Programs\LogixPlan\RoboticToolbox\python` and checks its version.
+2. It installs the wheels with `pip --no-index`, so it is offline.
+3. It copies `robot\`, `examples\` and the docs.
+4. It sets up the config:
+   - If `RC_CONFIG_DIR` is already set, the config goes in that folder. Otherwise it goes in
+     `%LOCALAPPDATA%\LogixPlan\config`, and `RC_CONFIG_DIR` is set to it.
+   - A new `remote_control.json` uses WebSocket on port 8765, with data in `Documents\LogixPlan\data`. An existing
+     file keeps its settings.
+   - Either way, the installer writes a `"toolbox"` section saying where the Toolbox is:
+     `{ "command": "<install>\python\pythonw.exe", "args": "-m robotic_toolbox" }`. Unity's
+     **IVI Dynamic › Robotic Toolbox › Open Robotic Toolbox** starts what it names, passing the Editor's
+     `RC_CONFIG_DIR` on.
+   - The Toolbox runs once per config, because it is the controller: a second start brings the running window to
+     the front.
+5. It adds Start menu shortcuts (Robotic Toolbox, Demo robot, Fake robot, Uninstall), a desktop shortcut and a
+   Settings > Apps entry.
+6. It checks that the installed modules are the compiled ones.
+
+Options: `-InstallDir`, `-ConfigDir`, `-DataDir`, `-Port` and `-Online`. `-NoShortcuts -NoRegister` installs without
+touching shortcuts, Settings or `RC_CONFIG_DIR`, for trying it on a development PC.
+
+The uninstaller refuses while the Toolbox or a robot from the install folder is running. It keeps the config and data
+unless given `-RemoveData`.
+
+**Testing on a clean VM** (Windows 10 / 11 x64):
+
+1. Copy the zip to the VM, unzip it and run `install.cmd`.
+2. Start the Toolbox, then *Demo robot (Unity)* or *Fake robot (demo)* from the Start menu. The robot should appear
+   as connected.
+3. On first start, Windows Firewall asks about Python listening on the network. *Allow* is needed only for robots
+   on other computers.
+
+### Minimal copy of a Unity robot project
+
+To move a Unity project to another PC (e.g. a test VM) without its gigabytes of `Library` and unused assets, copy
+only what some scenes need:
+
+```bat
+cd D:\Dev\remote_control\python
+.venv\Scripts\python tools\unity_min_copy.py "D:\Data\unity\project1\My project" Assets/Scenes/robot0625.unity --out "D:\Temp\min\My project" --zip
+```
+
+`tools\unity_min_copy.py` writes a self-contained copy:
+
+- **Scene assets:** the scenes and every asset they reference, found by following GUIDs through prefabs, materials and
+  so on, each with its `.meta`.
+- **Settings assets:** the assets the project settings reference.
+- **Code:** all C# scripts and assembly definitions.
+- **ProjectSettings:** with the build scene list reduced to the copied scenes.
+- **Packages:** the local `file:` packages (Remote Control, Bridge) embedded in `Packages\`, so the copy doesn't need
+  the original `D:\Dev\…` paths.
+
+For `robot0625` that is 129 MB (25 MB zipped) instead of 11 GB. Keep the project folder's name (`My project`): the
+robot reports it as its project, and the Toolbox files the robot data under it, so data copied from
+`data\My project\` matches. The first open in Unity (same version) rebuilds `Library` (about 2 minutes here).
 
 ## Tests
 
@@ -204,7 +352,7 @@ The ROS 2 tests need a sourced ROS 2 environment (rclpy, plus numpy for `sensor_
 `call C:\dev\ros2-windows\local_setup.bat && .venv38\Scripts\python -m unittest discover -s tests`.
 
 C# self-test of trajectory and parser, matched against the Python numbers:
-`dotnet run --project unity/Packages/com.robotmarket.remote-control/Tests~/DotnetRobot -- --selftest`
+`dotnet run --project unity/Packages/com.logixplan.remote-control/Tests~/DotnetRobot -- --selftest`
 
 End-to-end with the real Unity physics in a headless player build:
 
@@ -282,6 +430,78 @@ TOML needs Python 3.11+ or `tomli`).
 
 The pre-0.3 names (`RobotTransport`, `robot_transport_from_url`, `remote_control.transports`, …) still work as aliases.
 
+## Implementation details: joint groups and parallel goals
+
+### Robot side: the executor
+
+`python/remote_control/executor.py` and its C# port `Runtime/Core/MotionExecutor.cs` hold the goal logic. The two
+files mirror each other: change both, and the conformance tests in `tests/test_motion.py` run against both.
+
+- **Goals, actives and the queue.** Every accepted goal goes into the queue. Running goals are in `actives`
+  (`_actives` in C#), and no two running goals share a joint. Each goal has its own timeline: `time` advances by
+  `dt × rate`, and `rate` ramps towards `target_rate` over `decel_time`. Pause, cancel and stop set `target_rate`
+  to 0, so the goal slows down along its path. Each goal ramps on its own, so pausing one goal does not slow the
+  others.
+- **Starting goals (`_start_ready` / `StartReady`).** This runs after every new goal and whenever a goal ends. It
+  walks the queue in order, keeping a set of busy joints: the joints of the running goals, plus those of the
+  queued goals it has skipped so far.
+  - A `parallel` goal starts if none of its joints is busy.
+  - A `queue` (sequential) goal starts only when nothing is running and it is first in the queue. Everything
+    behind it then waits.
+
+  Adding the joints of skipped goals to the busy set keeps goals on the same joint in arrival order. A goal on
+  free joints may still overtake them.
+- **Starting check.** A goal starts from the joints' measured positions. The speed of the move to its first point
+  is checked against `max_velocity` only at that moment, because the start position is not known earlier. If the
+  check fails, the goal is aborted.
+- **Tick.** Each running goal writes only its own joints. A finished goal frees its joints, and queued goals are
+  then started.
+- **State.** The robot is `paused` only when every running goal is paused. One moving goal makes it `executing`
+  (or `resuming`, `pausing`, `stopping`). `goal_id` and `pause_reason` describe the first running goal, as they
+  did before parallel goals, so older controllers still work. `active` and `goals` list every running goal.
+- **Accepted queue_position.** This is 0 if the goal started right away. Otherwise it is the number of goals it
+  waits for: for a parallel goal, only the running and queued goals that share its joints.
+- **Capability.** The robot announces `supports.parallel_goals` in `hello`. A robot without it never receives
+  `parallel`: `RobotHandle.parallel_on_busy` falls back to `queue`.
+
+### Controller side: groups and group poses
+
+- **groups.json.** `RobotStore.groups()`, `save_group()` and `delete_group()` in `data.py` read and write
+  `groups.json` in the robot's data folder. `RobotHandle.save_joint_group()` first checks that the joint names
+  exist.
+- **Group poses.** `RobotHandle.save_pose(name, group=…)` stores only the group's joints, plus `"group": name`, in
+  `poses.json`. Going to a pose moves exactly the joints stored in it, so a group pose never touches other joints.
+- **move_group.** `RobotHandle.move_group(name, positions)` rejects joints outside the group. It then calls
+  `move_to` with `on_busy=parallel_on_busy`.
+
+### Toolbox
+
+- **Every move runs in parallel.** `backend.py` sends every move (jog, slider, pose, home, target) with
+  `on_busy=robot.parallel_on_busy`.
+- **Goal tracking.** `_watch()` records each goal with its joints in `Backend.goals` until the goal ends.
+  `running_goals(joints)` finds the goals that touch some joints. Per-group *Stop group*, Pause, Resume and Cancel
+  use it. With no joints given, they act on every running goal.
+- **Jog steps add up per joint.** `_jog_targets` keeps where each joint's pending jog steps end. While a jog of
+  that joint is still running, a new click continues from that target, not from the measured position. A failed
+  goal, or any other move of that joint, drops the entry. Continuous jog (*Hold*) cancels only the earlier goals
+  of that joint.
+- **Suggested groups.** `Backend.groups()` returns the saved groups first, then suggestions under names not yet
+  used:
+  - Short name prefixes (`L_`, `R_` …): finger, grip or jaw joints become `<prefix> gripper`, the rest
+    `<prefix> arm`.
+  - Each saved chain suggests its movable joints.
+
+  Groups containing every joint are skipped, since *All joints* covers them. Suggestions are computed each time
+  and are never stored until the user saves one in *Groups…*.
+- **Group home.** `go_home(group)` uses the group's joints from a saved `home` pose if one exists. Otherwise it
+  uses 0, clamped to the joint limits.
+- **UI** (`app.py`).
+  - `JogTab.group_name` is the selected group. `apply_group()` shows only its rows.
+  - `GroupsDialog` edits groups.
+  - `save_pose_dialog(group)` saves a group pose.
+  - The joint list is a `ScrolledWindow` that always shows its scrollbar. `wheel_scrolls_parent(slider,
+    always=True)` makes the mouse wheel over a joint slider scroll the list instead of moving the joint.
+
 ## Adding a connector type (serial, cloud relay …)
 
 1. Python: subclass `ControllerConnector` and `RobotConnector` (`python/remote_control/connectors/base.py`), then register the type in `CONNECTOR_TYPES` in `connectors/__init__.py` (name, URL schemes, builder from a config section).
@@ -299,7 +519,7 @@ python/
   remote_control/   protocol.py · trajectory.py · executor.py · robot.py · controller.py
                     connectors/  base · loopback · websocket · mqtt · ros2 · config (file loading)
                     drivers/ros2.py (Ros2JointDriver) · urdf.py (limits from URDF)
-                    kinematics.py (URDF tree, forward kinematics) · data.py (descriptions, saved poses)
+                    kinematics.py (URDF tree, forward kinematics) · data.py (descriptions, poses, chains, groups)
   robotic_toolbox/  app.py (wxPython window) · backend.py (controller thread) · ik.py (inverse kinematics)
   examples/         controller_demo.py (interactive / --script) · fake_robot.py
                     ros2_robot_bridge.py · fake_ros2_control.py · demo_arm.urdf
@@ -307,7 +527,7 @@ python/
                     build_cython.py (compiled build)
   tests/            test_motion.py (conformance suite) · test_toolbox.py (IK, toolbox backend)
 unity/              Unity 6 project
-  Packages/com.robotmarket.remote-control/
+  Packages/com.logixplan.remote-control/
     Runtime/Core/   no UnityEngine: Protocol · Trajectory · MotionExecutor · Transport (WebSocket) · MqttTransport · RobotSession
     Runtime/Plugins/MQTTnet/   MQTTnet 4.3.7 (netstandard2.1, MIT)
     Runtime/Unity/  ArticulationJointDriver · ArticulationDescriber (tree for describe) · RemoteControlRobot (component + overlay)

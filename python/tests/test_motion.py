@@ -13,7 +13,7 @@ MQTT tests use tools/mini_mqtt_broker.py, or a real broker if RC_MQTT_URL is set
 (e.g. RC_MQTT_URL=mqtt://localhost:1883 for Mosquitto).
 
 Run from the python/ folder:   python -m unittest discover -s tests -v
-The C# tests need the .NET SDK; they build unity/Packages/com.robotmarket.remote-control/Tests~/DotnetRobot.
+The C# tests need the .NET SDK; they build unity/Packages/com.logixplan.remote-control/Tests~/DotnetRobot.
 """
 import asyncio
 import json
@@ -51,7 +51,7 @@ DEMO_URDF = os.path.join(HERE, "..", "examples", "demo_arm.urdf")
 # repository root (tools/build_cython.py --test runs these tests from a build folder and sets RC_REPO_ROOT)
 REPO_ROOT = os.environ.get("RC_REPO_ROOT") or os.path.normpath(os.path.join(HERE, "..", ".."))
 DOTNET_PROJECT = os.path.normpath(os.path.join(
-    REPO_ROOT, "unity", "Packages", "com.robotmarket.remote-control", "Tests~", "DotnetRobot"))
+    REPO_ROOT, "unity", "Packages", "com.logixplan.remote-control", "Tests~", "DotnetRobot"))
 
 
 class TrajectoryTests(unittest.TestCase):

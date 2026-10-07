@@ -58,6 +58,45 @@ def set_windows_app_id() -> None:
             pass
 
 
+_instance_lock = None          # the single-instance mutex handle, held for the process' lifetime
+
+
+def activate_running_instance(key: str) -> bool:
+    """Windows: one Toolbox per config. Each Toolbox is the controller, so a second one with the same config would
+    fight the first for the port (WebSocket) or for the robots (MQTT). If one already runs, bring its window to the
+    front and return True; otherwise take the per-config mutex and return False."""
+    global _instance_lock
+    if not sys.platform.startswith("win"):
+        return False
+    import ctypes
+    import hashlib
+    from ctypes import wintypes
+    kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    name = "Local\\LogixPlan.RoboticToolbox." + hashlib.sha1(key.lower().encode("utf-8")).hexdigest()[:16]
+    _instance_lock = kernel32.CreateMutexW(None, False, name)
+    if kernel32.GetLastError() != 183:          # ERROR_ALREADY_EXISTS
+        return False
+    title = "LogixPlan " + APP_NAME
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _):
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        if buf.value == title and user32.IsWindowVisible(hwnd):
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if found:
+        if user32.IsIconic(found[0]):
+            user32.ShowWindow(found[0], 9)      # SW_RESTORE
+        user32.SetForegroundWindow(found[0])
+    return True
+
+
 def fmt(x: Optional[float], digits: int = 3) -> str:
     return "—" if x is None else f"{x:.{digits}f}"
 
@@ -1557,6 +1596,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="auto (default) follows the desktop's light / dark setting")
     args = ap.parse_args(argv)
 
+    # one Toolbox per config (or per --url): a second start brings the running one to the front
+    config_dir = os.environ.get("RC_CONFIG_DIR", "")
+    if activate_running_instance(args.url or (os.path.normcase(os.path.abspath(config_dir)) if config_dir else "")):
+        return 0
     set_windows_app_id()          # before any window exists
     app = wx.App()
     app.SetAppName(APP_NAME)
@@ -1565,9 +1608,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         backend.start()
     except Exception as exc:
-        wx.MessageBox(f"Could not start the controller:\n\n{exc}\n\nSet RC_CONFIG_DIR to the folder with "
-                      f"remote_control.json, or start with --url ws://0.0.0.0:8765/motion",
-                      APP_NAME, wx.OK | wx.ICON_ERROR)
+        if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (98, 10048):
+            hint = ("The port is used by another program - probably a Robotic Toolbox started with a different "
+                    "config. Close it, or give this config another port.")
+        else:
+            hint = ("Set RC_CONFIG_DIR to the folder with remote_control.json, or start with "
+                    "--url ws://0.0.0.0:8765/motion")
+        wx.MessageBox(f"Could not start the controller:\n\n{exc}\n\n{hint}", APP_NAME, wx.OK | wx.ICON_ERROR)
         return 2
     frame = ToolboxFrame(backend)
     frame.Show()

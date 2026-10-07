@@ -11,7 +11,7 @@ using UnityEngine;
 namespace RobotMarket.RemoteControl.Unity
 {
     [DisallowMultipleComponent]
-    [AddComponentMenu("RobotMarket/Remote Control Robot")]
+    [AddComponentMenu("IVI Dynamic/Remote Control Robot")]
     public sealed class RemoteControlRobot : MonoBehaviour
     {
         public enum ConnectionSource

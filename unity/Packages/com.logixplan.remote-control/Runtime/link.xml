@@ -1,0 +1,10 @@
+<!--
+  IL2CPP strips code it cannot see being used. Newtonsoft.Json (JObject / serialization) and MQTTnet create types
+  through reflection, so keep these assemblies whole in IL2CPP players. Unity reads link.xml files in packages too.
+-->
+<linker>
+  <assembly fullname="RobotMarket.RemoteControl.Core" preserve="all"/>
+  <assembly fullname="RobotMarket.RemoteControl" preserve="all"/>
+  <assembly fullname="Newtonsoft.Json" preserve="all"/>
+  <assembly fullname="MQTTnet" preserve="all"/>
+</linker>

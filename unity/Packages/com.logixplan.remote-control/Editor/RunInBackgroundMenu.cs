@@ -1,4 +1,4 @@
-// Menu: RobotMarket → Remote Control → Enable Run In Background
+// Menu: IVI Dynamic → Remote Control → Enable Run In Background
 // A remote-controlled robot must keep simulating while you type in the controller's terminal. With Player
 // setting "Run In Background" off, Unity pauses Play mode whenever its window loses focus, heartbeats stop,
 // and the controller drops the robot after a couple of seconds.
@@ -10,7 +10,7 @@ namespace RobotMarket.RemoteControl.Editor
 {
     public static class RunInBackgroundMenu
     {
-        const string MenuPath = "RobotMarket/Remote Control/Enable Run In Background";
+        const string MenuPath = "IVI Dynamic/Remote Control/Enable Run In Background";
 
         [MenuItem(MenuPath)]
         static void Enable()

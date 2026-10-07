@@ -58,8 +58,12 @@ class Backend:
         self.positions: Dict[str, float] = {}
         self.live: Dict[str, Any] = {}    # latest describe(tree=False): base / robot pose, scene targets
         self.goal: Optional[GoalHandle] = None          # last goal sent from the toolbox
+        # Per joint: where its pending jog steps end, so quick clicks add up instead of each starting from the
+        # measured position. Dropped when a goal on that joint fails or a non-jog move takes the joint over.
         self._jog_targets: Dict[str, float] = {}
-        self.goals: Dict[str, Tuple[GoalHandle, set]] = {}   # goals sent from here that are still running
+        # goal_id -> (goal, its joints) for goals sent from here that are still running: per-group stop /
+        # pause / resume, and jog accumulation per joint, look goals up here by joint.
+        self.goals: Dict[str, Tuple[GoalHandle, set]] = {}
         self._listening: set = set()
         self._poll_task: Optional[asyncio.Task] = None
         self._thread: Optional[threading.Thread] = None
@@ -249,6 +253,7 @@ class Backend:
         return self._require_robot().parallel_on_busy
 
     def _watch(self, goal: GoalHandle, what: str, joints) -> GoalHandle:
+        """Track a goal until its result: log it, and forget it (and its joints' jog targets unless it succeeded)."""
         self.goal = goal
         self.goals[goal.goal_id] = (goal, set(joints))
 
@@ -290,6 +295,7 @@ class Backend:
         """Move one joint by delta (rad / m) from its last jog target (quick clicks add up)."""
         robot = self._require_robot()
         j = self.joint(name)
+        # While a jog of this joint is still running, continue from its target; otherwise from the measured position.
         base = self._jog_targets.get(name) if self.running_goals([name]) else None
         if base is None:
             base = (await robot.current_positions()).get(name, 0.0)
@@ -371,22 +377,27 @@ class Backend:
             return []
         names = robot.joint_names
         out: List[Dict[str, Any]] = []
+        # Saved groups first; their names win over suggestions with the same name.
         saved = robot.joint_groups() if self.data_dir is not None else {}
         for n, js in saved.items():
             out.append({"name": n, "joints": [j for j in js if j in names], "builtin": False})
         taken = set(saved)
 
         def suggest(name: str, joints: List[str]) -> None:
+            # skip empty groups and "groups" that are the whole robot (that is the All joints entry)
             if name not in taken and joints and len(joints) < len(names):
                 taken.add(name)
                 out.append({"name": name, "joints": joints, "builtin": True})
 
+        # Short name prefixes (L_, R_, LA_ …) usually mark a side or an arm; finger / grip / jaw joints in it
+        # become that side's gripper group, the rest its arm group.
         prefixes = sorted({n.split("_")[0] for n in names if "_" in n and len(n.split("_")[0]) <= 3})
         for pre in prefixes:
             members = [n for n in names if n.startswith(pre + "_")]
             grip = [n for n in members if any(k in n.lower() for k in ("finger", "grip", "jaw"))]
             suggest(f"{pre} arm" if grip else pre, [n for n in members if n not in grip] or members)
             suggest(f"{pre} gripper", grip)
+        # Each saved kinematic chain suggests a group of its movable joints.
         try:
             for cname, c in sorted(self.chains().items()):
                 suggest(cname, self.chain(c["end"], c["origin"], cname).joint_names)

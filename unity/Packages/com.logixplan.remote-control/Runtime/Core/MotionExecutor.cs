@@ -53,21 +53,25 @@ namespace RobotMarket.RemoteControl
     /// </summary>
     public sealed class MotionExecutor
     {
+        /// <summary>One accepted goal: queued (Traj is null) or running (in _actives). Time advances by
+        /// dt × Rate; Rate ramps towards TargetRate (1 = run, 0 = halt), which is how pause / cancel / stop slow it
+        /// down along the path. Each goal has its own rate, so pausing one does not affect a parallel one.</summary>
         sealed class Goal
         {
             public string Id;
             public GoalSpec Spec;
-            public HashSet<string> JointSet;
+            public HashSet<string> JointSet;    // running goals never share a joint
             public Trajectory Traj;
-            public double Time;
-            public double Rate = 1;
-            public double TargetRate = 1;
+            public double Time;                 // position on the goal's timeline (s)
+            public double Rate = 1;             // current time scale
+            public double TargetRate = 1;       // time scale being ramped to
             public string EndStatus;        // set while slowing down to cancel/stop
             public string EndMessage = "";
             public string PauseReason;
             public int NextPoint;
             public double SinceFeedback;
 
+            // on_busy "parallel": may run next to goals on other joints; other modes run only when idle
             public bool Parallel => Spec.OnBusy == "parallel";
 
             public string State
@@ -112,6 +116,7 @@ namespace RobotMarket.RemoteControl
             get
             {
                 if (_actives.Count == 0) return RobotState.Idle;
+                // "paused" only when every running goal is; one moving goal makes the robot "executing" etc.
                 var states = new HashSet<string>(_actives.Select(g => g.State));
                 foreach (var s in new[] { RobotState.Executing, RobotState.Resuming, RobotState.Pausing, RobotState.Stopping })
                     if (states.Contains(s)) return s;
@@ -136,6 +141,8 @@ namespace RobotMarket.RemoteControl
                 {
                     ["state"] = g.State, ["joints"] = new JArray(g.Spec.JointNames), ["pause_reason"] = g.PauseReason,
                 };
+            // goal_id / pause_reason keep the single-goal meaning for older controllers; "active" and "goals"
+            // list every running goal for controllers that use parallel goals.
             return new JObject
             {
                 ["state"] = State,
@@ -199,13 +206,14 @@ namespace RobotMarket.RemoteControl
                 foreach (var a in _actives)
                     if (a.EndStatus == null) BeginEnd(a, GoalStatus.Canceled, "replaced by a new goal");
             }
+            // Every goal enters the queue; StartReady() decides whether it may start right away.
             var goal = new Goal { Id = goalId, Spec = spec, JointSet = new HashSet<string>(spec.JointNames) };
             _knownIds.Add(goalId);
             _queue.Add(goal);
             StartReady();
             int position;
             if (_actives.Contains(goal)) position = 0;
-            else
+            else   // goals that still have to finish before this one can start
             {
                 int index = _queue.IndexOf(goal);
                 int ahead = _actives.Count(a => !goal.Parallel || a.JointSet.Overlaps(goal.JointSet))
@@ -292,7 +300,9 @@ namespace RobotMarket.RemoteControl
         // ── motion ───────────────────────────────────────────────────────────
 
         /// <summary>Start queued goals that may run now, in queue order: a "parallel" goal when none of its joints
-        /// is used by a running goal or an earlier queued goal; any other goal only when idle and first in line.</summary>
+        /// is used by a running goal or an earlier queued goal; any other goal only when idle and first in line.
+        /// busy collects the joints of running goals and of goals skipped so far, so goals on the same joints start
+        /// in the order they arrived, while a goal on free joints may overtake them.</summary>
         void StartReady()
         {
             var busy = new HashSet<string>(_actives.SelectMany(a => a.JointSet));
@@ -311,6 +321,8 @@ namespace RobotMarket.RemoteControl
             PublishState();
         }
 
+        /// <summary>Start a goal from the joints' current positions. The move to the first point is checked
+        /// against max velocity only now, since the start is not known earlier. False if it was aborted.</summary>
         bool Begin(Goal g)
         {
             var pos = _driver.ReadPositions();
@@ -336,6 +348,7 @@ namespace RobotMarket.RemoteControl
                 if (_queue.Count > 0) StartReady();
                 return;
             }
+            // Each running goal writes only its own joints; a finished goal frees its joints for queued goals.
             bool finished = false;
             foreach (var g in _actives.ToList())
                 if (TickGoal(g, dt)) { _actives.Remove(g); finished = true; }

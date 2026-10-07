@@ -60,9 +60,14 @@ def main() -> int:
         return 2
 
     out = Path(args.out).resolve()
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    # Empty the folder rather than delete it: Windows cannot delete a folder that is some process's current
+    # directory (e.g. a terminal left in build/cython after running the app from there).
+    out.mkdir(parents=True, exist_ok=True)
+    for child in out.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
     for pkg in args.packages:
         copy_tree(ROOT / pkg, out / pkg)
     for name in COPY_AS_SOURCE:

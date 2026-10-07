@@ -13,5 +13,10 @@
   "heartbeat": {
     "interval": 0.5,
     "timeout": 2.0
+  },
+  "toolbox": {
+    "command": "D:\\Dev\\remote_control\\python\\.venv\\Scripts\\pythonw.exe",
+    "args": "-m robotic_toolbox",
+    "working_dir": "D:\\Dev\\remote_control\\python"
   }
 }

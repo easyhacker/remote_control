@@ -1,7 +1,7 @@
 {
   "dependencies": {
-    "com.robotmarket.remote-control": {
-      "version": "file:com.robotmarket.remote-control",
+    "com.logixplan.remote-control": {
+      "version": "file:com.logixplan.remote-control",
       "depth": 0,
       "source": "embedded",
       "dependencies": {

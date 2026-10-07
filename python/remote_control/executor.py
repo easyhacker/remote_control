@@ -62,14 +62,20 @@ class FakeDriver(JointDriver):
 
 
 class _Goal:
+    """One accepted goal: queued (traj is None) or running (in MotionExecutor.actives).
+
+    Its own timeline: `time` advances by dt × `rate`; `rate` ramps towards `target_rate` (1 = run, 0 = halt), which
+    is how pause / cancel / stop slow it down along the path. Each goal has its own rate, so pausing one goal does
+    not affect another one running in parallel."""
+
     def __init__(self, goal_id: str, spec: GoalSpec) -> None:
         self.id = goal_id
         self.spec = spec
-        self.joint_set: Set[str] = set(spec.joint_names)
+        self.joint_set: Set[str] = set(spec.joint_names)   # running goals never share a joint
         self.traj: Optional[Trajectory] = None
-        self.time = 0.0
-        self.rate = 1.0
-        self.target_rate = 1.0
+        self.time = 0.0                          # position on the goal's timeline (s)
+        self.rate = 1.0                          # current time scale
+        self.target_rate = 1.0                   # time scale being ramped to
         self.end_status: Optional[str] = None   # set while slowing down to cancel/stop
         self.end_message = ""
         self.pause_reason: Optional[str] = None
@@ -79,6 +85,7 @@ class _Goal:
 
     @property
     def parallel(self) -> bool:
+        """on_busy="parallel": may run next to goals on other joints. Other modes run only when the robot is idle."""
         return self.spec.on_busy == "parallel"
 
     @property
@@ -116,6 +123,7 @@ class MotionExecutor:
         """Robot state: idle, or the 'busiest' state of the running goals."""
         if not self.actives:
             return RobotState.IDLE
+        # A robot is "paused" only when every running goal is; one moving goal makes it "executing" etc.
         states = {g.state for g in self.actives}
         for s in (RobotState.EXECUTING, RobotState.RESUMING, RobotState.PAUSING, RobotState.STOPPING):
             if s in states:
@@ -126,6 +134,8 @@ class MotionExecutor:
         pos = self.driver.read_positions()
         first = self.active
         paused = next((g for g in self.actives if g.pause_reason), None)
+        # goal_id / pause_reason keep the single-goal meaning for older controllers; "active" and "goals" list
+        # every running goal for controllers that use parallel goals.
         return {
             "state": self.state,
             "goal_id": first.id if first else None,
@@ -188,6 +198,7 @@ class MotionExecutor:
             for g in self.actives:
                 if not g.end_status:
                     self._begin_end(g, GoalStatus.CANCELED, "replaced by a new goal")
+        # Every goal enters the queue; _start_ready() decides whether it may start right away.
         goal = _Goal(goal_id, spec)
         self._known_ids.add(goal_id)
         self.queue.append(goal)
@@ -280,7 +291,10 @@ class MotionExecutor:
     def _start_ready(self) -> None:
         """Start queued goals that may run now, in queue order:
         a "parallel" goal when none of its joints is used by a running goal or by an earlier queued goal;
-        any other goal only when the robot is idle and nothing queued is ahead of it."""
+        any other goal only when the robot is idle and nothing queued is ahead of it.
+
+        `busy` collects the joints of running goals and of goals skipped so far, so goals on the same joints always
+        start in the order they arrived, while a goal on free joints may overtake them."""
         busy: Set[str] = set()
         for g in self.actives:
             busy |= g.joint_set
@@ -301,6 +315,8 @@ class MotionExecutor:
         self._publish_state()
 
     def _begin(self, g: _Goal) -> bool:
+        """Start a goal from the joints' current positions. The move to the first point is checked against the
+        joints' max velocity only now, since the start position is not known earlier. False if it was aborted."""
         spec = g.spec
         pos = self.driver.read_positions()
         start = [pos[n] for n in spec.joint_names]
@@ -321,6 +337,7 @@ class MotionExecutor:
             if self.queue:
                 self._start_ready()
             return
+        # Each running goal writes only its own joints; a finished goal frees its joints for queued goals.
         finished = False
         for g in list(self.actives):
             if self._tick_goal(g, dt):

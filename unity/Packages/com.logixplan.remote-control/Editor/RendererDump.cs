@@ -1,4 +1,4 @@
-// Menu: RobotMarket → Remote Control → Debug: Dump Renderers of Selection
+// Menu: IVI Dynamic → Remote Control → Debug: Dump Renderers of Selection
 // Writes what Unity actually has loaded for every renderer under the selected object (active state,
 // enabled, world bounds, mesh + vertex count, material/shader, layer, scene-visibility) to
 // Logs/renderer_dump.txt — for diagnosing parts that exist in the Hierarchy but don't show up.
@@ -13,7 +13,7 @@ namespace RobotMarket.RemoteControl.Editor
 {
     public static class RendererDump
     {
-        [MenuItem("RobotMarket/Remote Control/Debug: Dump Renderers of Selection")]
+        [MenuItem("IVI Dynamic/Remote Control/Debug: Dump Renderers of Selection")]
         static void Dump()
         {
             var root = Selection.activeGameObject;

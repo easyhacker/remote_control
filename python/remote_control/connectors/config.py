@@ -8,8 +8,9 @@ The system uses ONE config file, shared by the controller and every robot (Pytho
     {
       "connector": { "type": "mqtt", "host": "broker.local", "port": 1883, "prefix": "rc",
                      "username": "robot", "password_env": "RC_MQTT_PASSWORD" },
-      "heartbeat": { "interval": 0.5, "timeout": 2.0 }          # controller; robots get it in `welcome`
-    }
+      "heartbeat": { "interval": 0.5, "timeout": 2.0 },         # controller; robots get it in `welcome`
+      "toolbox": { "command": "...\\pythonw.exe", "args": "-m robotic_toolbox" }   # optional: what Unity's
+    }                                                            # "Open Robotic Toolbox" menu starts
 
 `load_system_config()` finds and reads it; it raises ConfigError naming RC_CONFIG_DIR / the expected path
 when either is missing. The file is JSON so the Unity client (C#) reads the very same file.

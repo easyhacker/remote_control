@@ -26,7 +26,7 @@ namespace RobotMarket.RemoteControl.Unity
 
     [DisallowMultipleComponent]
     [SelectionBase]
-    [AddComponentMenu("RobotMarket/Remote Control Target")]
+    [AddComponentMenu("IVI Dynamic/Remote Control Target")]
     public sealed class RemoteControlTarget : MonoBehaviour
     {
         public const string RootName = "Targets";

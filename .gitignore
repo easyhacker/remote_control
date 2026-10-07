@@ -24,3 +24,6 @@ unity/.vs/
 
 # Robot data (descriptions, saved poses): local to each machine
 /data/
+
+# Release output (tools/build_release.py)
+python/dist/

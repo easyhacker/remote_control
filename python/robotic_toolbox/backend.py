@@ -29,6 +29,7 @@ from remote_control import (ConfigError, GoalHandle, MotionController, RobotHand
 from remote_control.kinematics import forward_kinematics
 
 from .ik import Chain, IkResult, pose_from_xyz_rpy, rpy_matrix, xyz_rpy_from_pose
+from .mobile import MobileDrive
 from .motion import MotionRunner
 
 Post = Callable[[Callable[[], None]], Any]
@@ -81,6 +82,7 @@ class Backend:
         self.on_selected: Callable[[Optional[str]], None] = lambda item_id: None   # picked in the robot's viewer
         self.on_edited: Callable[[Dict[str, Any]], None] = lambda payload: None    # moved in the robot's viewer
         self.motion = MotionRunner(self)          # Motion tab: programs and the external planner endpoint
+        self.drive = MobileDrive(self)            # Drive tab: mobile robots (Unity Mobile Base Drive)
 
     # ── thread plumbing ──────────────────────────────────────────────────────
 
@@ -890,6 +892,11 @@ class Backend:
                            target=None, chain_name: Optional[str] = None, focus: Optional[str] = None) -> bool:
         """Send the markers to the robot's viewer; False if the robot has none. `focus`: item to select for editing."""
         if not self.can_visualize or not tool:
+            return False
+        # Right after switching robots the tabs may still name the previous robot's links: never send a chain this
+        # robot does not have (its viewer would reject it); the tabs redraw once its description has arrived.
+        links = set(Chain.links(self.description)) if self.description else set()
+        if tool not in links or (base and base not in links):
             return False
         items = self.marker_items(tool, base, selected, target, chain_name, focus)
         await self.robot.visualize(items)  # type: ignore[union-attr]

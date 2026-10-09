@@ -142,6 +142,33 @@ The reply to `describe`. `ref_seq` is the `seq` of the request.
 - A robot that knows no geometry sends `joints` with `parent` / `child` / `origin` left out or `null`.
 - On failure: `{ "ref_seq": 21, "ok": false, "message": "..." }`.
 
+**`mobile_base`** (optional, in every description): present when the robot drives on wheels. In Unity, this means it
+has the Mobile Base Drive component. There's no new message for driving; a controller drives the robot by moving the
+wheel joints with `execute`. The section tells it how wheel angles translate into motion.
+```json
+"mobile_base": { "type": "differential", "left_wheel": "Wheel_L", "right_wheel": "Wheel_R",
+                 "wheel_radius": 0.045, "track": 0.5, "left_sign": 1, "right_sign": 1,
+                 "forward": [0.0, -1.0, 0.0], "center": [0.0, -0.3, -0.045], "casters": ["Caster_F", "Caster_R"] }
+```
+- `left_wheel`, `right_wheel`: the drive wheels' `command_name`s. They are joints like any other, usually `continuous`
+  with no limits.
+- `wheel_radius`: metres. `track`: the distance between the two wheel centres, in metres.
+- `left_sign`, `right_sign`: `+1` if a positive angle on that wheel drives the robot **forward**, `-1` if it drives
+  it backwards. Both wheels often turn the same way about the same axle direction, but the signs say so explicitly.
+- `forward`: the robot's forward direction in the root link's frame. It is at right angles to the axle, with the left
+  wheel on the left.
+- `center`: the point the robot turns about when turning on the spot (midway between the wheels, on the floor), in
+  the root link's frame.
+- `casters`: swivel joints the robot steers itself to follow the motion. A controller doesn't need to command them.
+
+How wheel angles move the robot: a robot with `mobile_base` rolls its wheels without slipping.
+- Driving a distance `d` (forward positive) while turning by an angle `θ` (left, counter-clockwise from above,
+  positive) means wheel travel `d − θ·track/2` on the left and `d + θ·track/2` on the right.
+- The wheel angle changes are `sign · travel / wheel_radius`.
+- As the robot drives, `base_pose` (and `robot_pose`) change. The robot's position in the world is the `base_pose`
+  of the latest description. Its **heading** is the angle of `forward`, turned into world coordinates by
+  `base_pose`, measured from the world +x axis, counter-clockwise from above.
+
 ### `selected`
 The user picked a visualized item in the robot's viewer (clicked a frame in Unity's Game view, selected it in the
 Hierarchy). Robots without a viewer never send it.

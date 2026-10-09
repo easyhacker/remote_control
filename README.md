@@ -176,6 +176,7 @@ A wxPython controller with native widgets on Windows, macOS and Linux:
   focus goes back to the Unity window matching the robot's project and scene. It never switches while a mouse
   button is held, while a dialog is open, or when another program is in front. Built players aren't throttled and
   don't need it.
+- **Mobile robots:** see [Driving mobile robots](#driving-mobile-robots) below.
 - **Viewer:** robots with `supports.visualize` (Unity) draw the chain, the TCP and the frames. Clicking a frame in
   Unity's Game view, or selecting it in the Hierarchy, makes it the target in the Toolbox. TCPs and frames are stored
   in the robot's data folder (`chains.json` with each chain's TCP, `frames.json`).
@@ -195,6 +196,69 @@ The bridge runs on the ROS install's Python (3.8 on Windows Humble) and the Tool
 ```
 Robotic Toolbox (3.12) ⇄ WebSocket / MQTT ⇄ ros2_robot_bridge.py (3.8 + rclpy) ⇄ ros2_control robot
 ```
+
+### Driving mobile robots
+
+A robot with drive wheels, for example the gantry on a mobile base, drives over the floor when its wheels turn. The
+Toolbox's **Drive** tab drives it in robot terms: forward, back, turn, go to a position.
+
+**Unity setup:**
+1. Import the robot with real wheel joints. In URDF the wheels are `continuous` joints; `usd_converter.py` in
+   robosynth-home keeps them since October 2026, where it used to merge them into the base.
+2. Select the robot's top object. **Add Component › IVI Dynamic › Mobile Base Drive**.
+3. Check the **Left Wheel**, **Right Wheel** and **Casters** fields. They're filled in by name: `…_L` / `…left`,
+   `…_R` / `…right`, `Caster…`. Leave **Wheel Radius** at 0 to measure it from the wheel's shape.
+4. Press Play. The Console reports *"Mobile Base Drive: wheels …, radius …, track …, N caster(s)"*.
+
+**How the robot moves:**
+- **Kinematic differential drive.** Each physics step the component measures how far each wheel actually turned
+  and rolls it without slipping. Equal travel moves the robot straight; a difference turns it. One wheel revolution
+  is 2π × radius (28 cm for a 4.5 cm wheel).
+- **Exact and repeatable:** no wheel slip, bumps or inertia. The robot goes exactly where the wheels say. The base
+  stays *Immovable* for physics; it is moved directly, not pushed.
+- **Geometry from the model:** each wheel's axle, position and turning direction are read from the scene, so the
+  track width and wheel signs need no setup.
+- **Casters swivel** to point along the motion, either way round.
+- **Any wheel motion drives it,** whatever turns the wheel joints: the Drive tab, jog, sliders, poses, Motion
+  programs, the planner stream, the Bridge's Joint Target Controller.
+- **The rest of the Toolbox follows:** `base_pose` and `robot_pose` follow the robot, so scene targets, IK and
+  markers stay correct while it drives.
+
+**Drive tab:**
+- **Wheel info:** the top line shows the wheels, radius and track. If it says *"This robot cannot drive"*, the
+  component is missing, or Play was not restarted after adding it.
+- **Position in the scene:** X, Y and heading of the robot's turning centre (midway between the wheels), updated
+  live.
+- **Drive:**
+  - ▲ Forward / ▼ Back by the **Step** (0.01 to 1 m); ⟲ Left / ⟳ Right by the **Turn** step (1 to 180°), turning
+    on the spot.
+  - **■ Stop** slows the wheels to a halt.
+  - **Hold:** drive or turn for as long as a button is held.
+  - **Speed %:** a percentage of the wheels' max velocity.
+- **Drive to (scene coordinates):**
+  - Enter **X** and **Y**, and optionally a final **Heading**. **Here** fills in the current position; **Target…**
+    takes a target's position.
+  - **Go:** the robot turns towards the point, drives there in a straight line, then turns to the heading. It stops
+    between these moves so it stays on the line.
+  - With **May back up** ticked, a point behind the robot is reached by reversing instead of turning round.
+  - An empty heading keeps the direction it drove in.
+
+**Coordinates and heading** (the ROS convention, used throughout the Toolbox):
+- X, Y are scene coordinates in metres. Scene +X is Unity's +Z (blue arrow); scene +Y is Unity's −X (opposite the red
+  arrow).
+- **Heading** is the direction the robot faces, as an angle from scene +X, counter-clockwise seen from above:
+  - 0° faces +X; +90° faces +Y (a quarter turn left); ±180° faces −X; −90° faces −Y.
+  - *Forward* is the direction the robot drives when both wheels turn forward, at right angles to the axle, with the
+    left wheel on its left.
+- **Turning:** positive angles turn **left** (counter-clockwise), negative angles turn right.
+
+**Together with other motion:** wheel moves are ordinary parallel goals on the two wheel joints. The arm, gripper or
+lift can move while the base drives, and stopping a drive leaves other motions running.
+
+**Limits:**
+- No path planning or obstacle avoidance: "drive to" is turn → straight → turn.
+- Differential drive cannot move sideways: a pose step or program that changes only one wheel curves the robot.
+- No collisions with the floor or objects are simulated for the base.
 
 ### Cythonized build (Windows)
 

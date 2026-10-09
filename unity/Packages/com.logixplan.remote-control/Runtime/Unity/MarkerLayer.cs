@@ -199,6 +199,10 @@ namespace RobotMarket.RemoteControl.Unity
 
         void ApplyFrame(string id, JObject it)
         {
+            // resolve the parent link before creating anything: a frame on a link this robot lacks is reported in the
+            // ack and leaves nothing behind (it used to leave an unstyled 1 m sphere handle in the scene)
+            var parentName = it["parent"]?.Value<string>() ?? "";
+            var parent = Link(parentName);
             if (!_items.TryGetValue(id, out var item) || item.Kind != "frame")
             {
                 Remove(id);
@@ -217,6 +221,7 @@ namespace RobotMarket.RemoteControl.Unity
                 handle.name = "handle";
                 UnityEngine.Object.Destroy(handle.GetComponent<Collider>());   // never collides with the robot
                 handle.transform.SetParent(item.Go.transform, false);
+                handle.transform.localScale = Vector3.one * 0.02f;        // Style() sets the real size
                 var mr = handle.GetComponent<MeshRenderer>();
                 mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 mr.receiveShadows = false;
@@ -229,8 +234,7 @@ namespace RobotMarket.RemoteControl.Unity
             item.Editable = it["editable"]?.Value<bool>() ?? false;
             item.Size = it["size"]?.Value<float>() ?? (item.Style == "tcp" ? 0.08f : 0.1f);
             item.Go.name = ObjectName(it, item.Style == "tcp" ? "TCP" : "Frame", id);
-            item.Parent = it["parent"]?.Value<string>() ?? "";
-            var parent = Link(item.Parent);
+            item.Parent = parentName;
             item.Go.transform.SetParent(parent != null ? parent : Container().transform, false);
             if (item.ChangedAt < 0)   // don't yank a frame the user is dragging right now
             {
@@ -250,6 +254,10 @@ namespace RobotMarket.RemoteControl.Unity
 
         void ApplyChain(string id, JObject it)
         {
+            // validate before creating anything: a chain naming links this robot lacks (e.g. one meant for another
+            // robot) is reported in the ack and leaves no marker behind
+            var links = (it["links"] as JArray ?? new JArray()).Select(t => t.Value<string>()).ToArray();
+            foreach (var l in links) Link(l);
             if (!_items.TryGetValue(id, out var item) || item.Kind != "chain")
             {
                 Remove(id);
@@ -261,8 +269,7 @@ namespace RobotMarket.RemoteControl.Unity
                 _items[id] = item;
             }
             item.Go.name = ObjectName(it, "Chain", id);
-            item.Links = (it["links"] as JArray ?? new JArray()).Select(t => t.Value<string>()).ToArray();
-            foreach (var l in item.Links) Link(l);     // validate now: unknown links are reported in the ack
+            item.Links = links;
             item.End = it["end"]?.Value<string>();
             item.Label = it["label"]?.Value<string>() ?? id;
             item.Style = it["style"]?.Value<string>() ?? "chain";
@@ -295,7 +302,9 @@ namespace RobotMarket.RemoteControl.Unity
             var points = new List<Vector3>();
             foreach (var l in item.Links)
             {
-                var t = Link(l);
+                Transform t;
+                try { t = Link(l); }
+                catch (ArgumentException) { continue; }      // never throw every frame (the link may be gone)
                 if (t != null) points.Add(t.position);
             }
             if (item.End != null && _items.TryGetValue(item.End, out var end) && end.Go != null)

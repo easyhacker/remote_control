@@ -1704,6 +1704,172 @@ class MotionTab(wx.ScrolledWindow):
         self.planner_text.SetLabel(text)
 
 
+# ── Drive tab: mobile robots ──────────────────────────────────────────────────
+
+DRIVE_STEPS = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0]         # m
+TURN_STEPS = [1, 5, 15, 45, 90, 180]                     # degrees
+
+
+class DriveTab(wx.ScrolledWindow):
+    """Drive a mobile robot (Unity: Mobile Base Drive) - steps, hold-to-drive, and drive to a position."""
+
+    def __init__(self, parent: wx.Window, frame: "ToolboxFrame") -> None:
+        super().__init__(parent, style=wx.VSCROLL)
+        self.SetScrollRate(0, self.FromDIP(10))
+        self.frame = frame
+        self.b = frame.backend
+
+        self.note = wx.StaticText(self, label="")
+        pos_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Position in the scene")
+        self.pos_text = wx.StaticText(pos_box.GetStaticBox(), label="—")
+        pos_box.Add(self.pos_text, 0, wx.ALL, GAP)
+
+        jog_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Drive")
+        sb = jog_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.dist_step = wx.Choice(sb, choices=[f"{d:g} m" for d in DRIVE_STEPS])
+        self.dist_step.SetSelection(2)
+        self.turn_step = wx.Choice(sb, choices=[f"{t:g}°" for t in TURN_STEPS])
+        self.turn_step.SetSelection(2)
+        self.speed = wx.SpinCtrl(sb, min=5, max=100, initial=50, size=(self.FromDIP(56), -1))
+        self.speed.SetToolTip("Percent of the wheels' max velocity")
+        self.hold = wx.CheckBox(sb, label="Hold")
+        self.hold.SetToolTip("Hold to drive: keep a button pressed to drive or turn until released")
+        for label, ctrl in [("Step", self.dist_step), ("Turn", self.turn_step), ("Speed %", self.speed), (None, self.hold)]:
+            if label:
+                row.Add(wx.StaticText(sb, label=label), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
+            row.Add(ctrl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        jog_box.Add(row, 0, wx.ALL, GAP)
+
+        pad = wx.GridSizer(3, 3, GAP, GAP)
+        buttons = {}
+        for key, label, dist, turn in [("fwd", "▲ Forward", 1, 0), ("left", "⟲ Left", 0, 1), ("stop", "■ Stop", 0, 0),
+                                       ("right", "⟳ Right", 0, -1), ("back", "▼ Back", -1, 0)]:
+            btn = wx.Button(sb, label=label)
+            buttons[key] = btn
+            if key == "stop":
+                btn.Bind(wx.EVT_BUTTON, lambda e: self.frame.run(self.b.drive.stop(), what="drive"))
+                continue
+            btn.Bind(wx.EVT_BUTTON, lambda e, d=dist, t=turn: self.click(d, t))
+            btn.Bind(wx.EVT_LEFT_DOWN, lambda e, d=dist, t=turn: self.press(e, d, t))
+            btn.Bind(wx.EVT_LEFT_UP, self.release)
+        for key in (None, "fwd", None, "left", "stop", "right", None, "back", None):
+            pad.Add(buttons[key] if key else (0, 0), 0, wx.EXPAND)
+        jog_box.Add(pad, 0, wx.ALL, GAP)
+
+        goto_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Drive to (scene coordinates)")
+        sb = goto_box.GetStaticBox()
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.goto = {}
+        for key, label in [("x", "X m"), ("y", "Y m"), ("heading", "Heading °")]:
+            ctrl = wx.TextCtrl(sb, size=(self.FromDIP(64), -1))
+            self.goto[key] = ctrl
+            row.Add(wx.StaticText(sb, label=label), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 3)
+            row.Add(ctrl, 0, wx.RIGHT, 8)
+        self.goto["heading"].SetToolTip("Final heading; empty = keep the direction it drove in")
+        goto_box.Add(row, 0, wx.ALL, GAP)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.reverse = wx.CheckBox(sb, label="May back up")
+        self.reverse.SetValue(True)
+        self.reverse.SetToolTip("Drive backwards to a goal behind the robot instead of turning round first")
+        for label, handler, tip in [("Here", self.fill_here, "Fill in the robot's current position"),
+                                    ("Target…", self.fill_target, "Fill in a target's position (Tool & Targets)"),
+                                    ("Go", self.drive_to, "Turn towards the position, drive there, turn to the heading")]:
+            btn = wx.Button(sb, label=label, style=wx.BU_EXACTFIT)
+            btn.SetToolTip(tip)
+            btn.Bind(wx.EVT_BUTTON, lambda e, h=handler: h())
+            row.Add(btn, 0, wx.RIGHT, GAP)
+        row.Add(self.reverse, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        goto_box.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(self.note, 0, wx.EXPAND | wx.ALL, GAP)
+        for box in (pos_box, jog_box, goto_box):
+            s.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, GAP)
+        self.SetSizer(s)
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda e: self.show_position(), self.timer)
+        self.timer.Start(250)
+        self.robot_changed()
+
+    @property
+    def speed_fraction(self) -> float:
+        return self.speed.GetValue() / 100.0
+
+    def robot_changed(self) -> None:
+        info = self.b.drive.info
+        if info:
+            self.note.SetLabel(f"Wheels {info['left_wheel']} / {info['right_wheel']}, radius "
+                               f"{info['wheel_radius'] * 1000:.0f} mm, track {info['track'] * 1000:.0f} mm")
+        else:
+            self.note.SetLabel("This robot cannot drive. Unity: select the robot, Add Component › "
+                               "IVI Dynamic › Mobile Base Drive, then press Play again.")
+        self.Layout()
+
+    def show_position(self) -> None:
+        pos = self.b.drive.position()
+        text = "—" if pos is None else f"X {pos[0]:+.3f} m    Y {pos[1]:+.3f} m    heading {math.degrees(pos[2]):+.1f}°"
+        if self.b.drive.message:
+            text += f"\n{self.b.drive.message}"
+        if self.pos_text.GetLabel() != text:
+            self.pos_text.SetLabel(text)
+
+    # driving
+    def click(self, dist: int, turn: int) -> None:
+        if not self.hold.GetValue():
+            d = dist * DRIVE_STEPS[self.dist_step.GetSelection()]
+            t = turn * math.radians(TURN_STEPS[self.turn_step.GetSelection()])
+            self.frame.run(self.b.drive.step(d, t, self.speed_fraction), what="drive")
+
+    def press(self, event: wx.MouseEvent, dist: int, turn: int) -> None:
+        event.Skip()
+        if self.hold.GetValue():
+            self.frame.run(self.b.drive.start(dist, turn, self.speed_fraction), what="drive")
+
+    def release(self, event: wx.MouseEvent) -> None:
+        event.Skip()
+        if self.hold.GetValue():
+            self.frame.run(self.b.drive.stop(), what="drive")
+
+    def fill_here(self) -> None:
+        pos = self.b.drive.position()
+        if pos is not None:
+            self.goto["x"].ChangeValue(f"{pos[0]:.3f}")
+            self.goto["y"].ChangeValue(f"{pos[1]:.3f}")
+            self.goto["heading"].ChangeValue(f"{math.degrees(pos[2]):.1f}")
+
+    def fill_target(self) -> None:
+        targets = self.b.targets_list() if self.b.description else []
+        if not targets:
+            self.frame.log("drive: no targets (create one in Tool & Targets)")
+            return
+        with wx.SingleChoiceDialog(self, "Drive to the position of:", "Drive to target",
+                                   [label for _, label in targets]) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            tid = targets[dlg.GetSelection()][0]
+        try:
+            xyz, _ = self.b.target_pose(tid, "scene", (self.b.description or {}).get("root", ""))
+        except Exception as exc:
+            self.frame.log(f"drive: {exc}")
+            return
+        self.goto["x"].ChangeValue(f"{xyz[0]:.3f}")
+        self.goto["y"].ChangeValue(f"{xyz[1]:.3f}")
+        self.goto["heading"].ChangeValue("")
+
+    def drive_to(self) -> None:
+        try:
+            x = float(self.goto["x"].GetValue().replace(",", "."))
+            y = float(self.goto["y"].GetValue().replace(",", "."))
+            h = self.goto["heading"].GetValue().strip().replace(",", ".")
+            heading = math.radians(float(h)) if h else None
+        except ValueError:
+            self.frame.log("drive: X and Y must be numbers (heading may be empty)")
+            return
+        self.frame.run(self.b.drive.drive_to(x, y, heading, self.speed_fraction, self.reverse.GetValue()),
+                       what="drive")
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 
 class ToolboxFrame(wx.Frame):
@@ -1799,10 +1965,12 @@ class ToolboxFrame(wx.Frame):
         self.poses = PosesTab(self.book, self)
         self.cart = CartesianTab(self.book, self)
         self.motion = MotionTab(self.book, self)
+        self.drive_tab = DriveTab(self.book, self)
         self.book.AddPage(self.jog, "Joint jog")
         self.book.AddPage(self.poses, "Poses")
         self.book.AddPage(self.cart, "Tool && Targets")
         self.book.AddPage(self.motion, "Motion")
+        self.book.AddPage(self.drive_tab, "Drive")
         # groups, chains, poses and targets change in the other tabs: re-read them when Motion is shown
         self.book.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED,
                        lambda e: (self.book.GetCurrentPage() is self.motion and self.motion.refresh(), e.Skip()))
@@ -1983,6 +2151,7 @@ class ToolboxFrame(wx.Frame):
         self.jog.refresh_groups()
         self.cart.robot_changed()
         self.motion.robot_changed()
+        self.drive_tab.robot_changed()
         self.poses.refresh()
         self.Layout()
 

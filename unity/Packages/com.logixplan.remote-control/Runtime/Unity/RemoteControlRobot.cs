@@ -207,9 +207,19 @@ namespace RobotMarket.RemoteControl.Unity
             _driver = driver;
             if (recordTracking)
             {
-                System.IO.Directory.CreateDirectory("Logs");
-                driver.Trace = new System.IO.StreamWriter("Logs/rc_tracking.csv", false) { AutoFlush = false };
-                Debug.Log("[RemoteControl] recording joint tracking to Logs/rc_tracking.csv", this);
+                // one file per robot (several robots in a scene must not share it); a file that cannot be opened only
+                // skips the recording - it must never keep the robot from connecting
+                var path = $"Logs/rc_tracking_{Slug(RobotId)}.csv";
+                try
+                {
+                    System.IO.Directory.CreateDirectory("Logs");
+                    driver.Trace = new System.IO.StreamWriter(path, false) { AutoFlush = false };
+                    Debug.Log($"[RemoteControl] recording joint tracking to {path}", this);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[RemoteControl] not recording joint tracking: cannot write {path} ({e.Message})", this);
+                }
             }
             Session = new RobotSession(transport, driver, RobotId, DisplayName, decelTime)
             {
@@ -220,7 +230,14 @@ namespace RobotMarket.RemoteControl.Unity
             Session.Describer = tree =>
             {
                 var d = ArticulationDescriber.Describe(root, driver, tree, gameObject);
-                d["robot_pose"] = ArticulationDescriber.Pose(transform.position, transform.rotation);
+                // a mobile base carries the robot instance's frame along (its own Transform stays where it was placed)
+                var drive = GetComponent<MobileBaseDrive>();
+                d["robot_pose"] = drive != null
+                    ? ArticulationDescriber.Pose(drive.TravelRotation * transform.position + drive.TravelOffset,
+                                                 drive.TravelRotation * transform.rotation)
+                    : ArticulationDescriber.Pose(transform.position, transform.rotation);
+                var mobile = drive != null ? drive.Describe(driver) : null;
+                if (mobile != null) d["mobile_base"] = mobile;      // the Toolbox's Drive tab uses it
                 d["targets"] = ListTargets();
                 return d;
             };

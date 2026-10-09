@@ -416,6 +416,48 @@ class BackendTests(unittest.TestCase):
         self.assertAlmostEqual(pos["wrist"], 0.0, places=4)                      # outside the scope: ignored
         self.assertGreaterEqual(m.planner_poses, 30)
 
+    # ── Drive tab ────────────────────────────────────────────────────────────
+
+    def test_drive_turns_wheel_joints_by_the_right_amounts(self):
+        """With a mobile_base description (here: elbow and wrist stand in for the wheels), drive steps turn the
+        wheel joints by travel / radius, opposite ways when turning on the spot."""
+        b = self.backend
+        info = {"type": "differential", "left_wheel": "elbow", "right_wheel": "wrist", "wheel_radius": 0.5,
+                "track": 1.0, "left_sign": 1, "right_sign": -1, "forward": [1, 0, 0], "center": [0, 0, 0]}
+        b.description["mobile_base"] = info
+        before = self.robot.positions()
+        self.wait_until(lambda: True)
+        goal = self.run_(b.drive.step(0.25, 0.0, speed=1.0))                 # 0.25 m forward
+        self.assertEqual(self.run_(goal.result(5))["status"], "succeeded")
+        pos = self.robot.positions()
+        self.assertAlmostEqual(pos["elbow"] - before["elbow"], 0.5, places=3)  # 0.25 m / 0.5 m radius
+        self.assertAlmostEqual(pos["wrist"] - before["wrist"], -0.5, places=3) # right_sign -1
+        goal = self.run_(b.drive.step(0.0, math.pi / 4, speed=1.0))          # 45° left on the spot
+        self.run_(goal.result(5))
+        after = self.robot.positions()
+        self.assertAlmostEqual(after["elbow"] - pos["elbow"], -math.pi / 4, places=3)   # left wheel back
+        self.assertAlmostEqual(after["wrist"] - pos["wrist"], -math.pi / 4, places=3)   # right wheel forward (sign -1)
+
+    def test_drive_to_plans_turn_drive_turn(self):
+        from robotic_toolbox.mobile import base_position, plan_drive_to, wheel_deltas
+        info = {"wheel_radius": 0.045, "track": 0.5, "left_sign": 1, "right_sign": 1,
+                "forward": [0, 1, 0], "center": [0.1, 0, 0]}
+        # base link at (1, 2) turned 90° left: forward (base +y) points along scene -x; centre 0.1 m along base +x
+        pose = {"position": [1, 2, 0], "orientation": [0, 0, math.sin(math.pi / 4), math.cos(math.pi / 4)]}
+        x, y, h = base_position(info, pose)
+        self.assertAlmostEqual(x, 1.0, places=6)
+        self.assertAlmostEqual(y, 2.1, places=6)
+        self.assertAlmostEqual(abs(h), math.pi, places=6)                            # ±pi: facing scene -x
+        segs = plan_drive_to((0, 0, 0), 0, 1, heading=0.0, allow_reverse=False)   # goal to the left
+        self.assertEqual([round(d, 6) for d, _ in segs], [0, 1, 0])
+        self.assertAlmostEqual(segs[0][1], math.pi / 2, places=6)
+        self.assertAlmostEqual(segs[2][1], -math.pi / 2, places=6)
+        segs = plan_drive_to((0, 0, 0), -2, 0)                                      # behind: back up
+        self.assertEqual(segs, [(-2.0, 0.0)])
+        dl, dr = wheel_deltas(info, 0.0, math.pi)                                   # half turn on the spot
+        self.assertAlmostEqual(dl, -math.pi * 0.25 / 0.045, places=6)
+        self.assertAlmostEqual(dr, math.pi * 0.25 / 0.045, places=6)
+
     def test_joint_groups_and_group_poses(self):
         b = self.backend
         b.save_group("arm", ["shoulder_yaw", "shoulder_pitch", "elbow", "wrist"])
